@@ -1,18 +1,31 @@
 import math
 import copy
+from datetime import timedelta
 from pathlib import Path
 from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
 
+import tempfile
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 from torch.amp import autocast
+from torch.utils.tensorboard import SummaryWriter, writer
+from torch.utils.data import Dataset, DataLoader
+
+from torch.optim import Adam
+from ema_pytorch import EMA
+
+
+from torchvision import transforms as T, utils
 
 from einops import rearrange, reduce, repeat, pack, unpack
 from einops.layers.torch import Rearrange
+
+from denoising_diffusion_pytorch.version import __version__
+from accelerate import Accelerator, InitProcessGroupKwargs
 
 from tqdm.auto import tqdm
 
@@ -37,6 +50,9 @@ def cycle(dl):
     while True:
         for data in dl:
             yield data
+
+def divisible_by(numer, denom):
+    return (numer % denom) == 0
 
 def has_int_squareroot(num):
     return (math.sqrt(num) ** 2) == num
@@ -170,11 +186,12 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
 # building block modules
 
 class Block(nn.Module):
-    def __init__(self, dim, dim_out):
+    def __init__(self, dim, dim_out, dropout=0.0):
         super().__init__()
         self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
         self.norm = RMSNorm(dim_out)
         self.act = nn.SiLU()
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x, scale_shift = None):
         x = self.proj(x)
@@ -185,10 +202,10 @@ class Block(nn.Module):
             x = x * (scale + 1) + shift
 
         x = self.act(x)
-        return x
+        return self.dropout(x)
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim = None, classes_emb_dim = None):
+    def __init__(self, dim, dim_out, *, time_emb_dim = None, classes_emb_dim = None, dropout = 0.0):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
@@ -196,7 +213,7 @@ class ResnetBlock(nn.Module):
         ) if exists(time_emb_dim) or exists(classes_emb_dim) else None
 
         self.block1 = Block(dim, dim_out)
-        self.block2 = Block(dim_out, dim_out)
+        self.block2 = Block(dim_out, dim_out, dropout)
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb = None, class_emb = None):
@@ -285,13 +302,16 @@ class Unet(nn.Module):
         random_fourier_features = False,
         learned_sinusoidal_dim = 16,
         attn_dim_head = 32,
-        attn_heads = 4
+        attn_heads = 4,
+        dropout = 0.1
     ):
         super().__init__()
 
         # classifier free guidance stuff
 
         self.cond_drop_prob = cond_drop_prob
+
+        self.dropout = dropout
 
         # determine dimensions
 
@@ -325,7 +345,7 @@ class Unet(nn.Module):
         )
 
         # class embeddings
-
+        self.num_classes = num_classes
         self.classes_emb = nn.Embedding(num_classes, dim)
         self.null_classes_emb = nn.Parameter(torch.randn(dim))
 
@@ -703,7 +723,7 @@ class GaussianDiffusion(nn.Module):
         img = unnormalize_to_zero_to_one(img)
         return img
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def ddim_sample(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
@@ -738,13 +758,19 @@ class GaussianDiffusion(nn.Module):
         img = unnormalize_to_zero_to_one(img)
         return img
 
-    @torch.no_grad()
-    def sample(self, classes, cond_scale = 6., rescaled_phi = 0.7):
+    @torch.inference_mode()
+    def sample_with_class(self, classes, cond_scale = 6., rescaled_phi = 0.7):
         batch_size, image_size, channels = classes.shape[0], self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn(classes, (batch_size, channels, image_size, image_size), cond_scale, rescaled_phi)
 
-    @torch.no_grad()
+    # sample with random classes
+    @torch.inference_mode()
+    def sample(self, batch_size = 16, cond_scale = 6., rescaled_phi = 0.7):
+        classes = torch.randint(0, self.model.num_classes, (batch_size,), device = self.device)
+        return self.sample_with_class(classes, cond_scale, rescaled_phi)
+
+    @torch.inference_mode()
     def interpolate(self, x1, x2, classes, t = None, lam = 0.5):
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
@@ -809,6 +835,274 @@ class GaussianDiffusion(nn.Module):
 
         img = normalize_to_neg_one_to_one(img)
         return self.p_losses(img, t, *args, **kwargs)
+
+class Trainer:
+    def __init__(
+        self,
+        diffusion_model,
+        dataset,
+        *,
+        train_batch_size = 16,
+        gradient_accumulate_every = 1,
+        augment_horizontal_flip = True,
+        train_lr = 1e-4,
+        train_num_steps = 100000,
+        ema_update_every = 10,
+        ema_decay = 0.995,
+        adam_betas = (0.9, 0.99),
+        save_and_sample_every = 1000,
+        num_samples = 25,
+        results_folder = None,
+        amp = False,
+        mixed_precision_type = 'fp16',
+        split_batches = True,
+        convert_image_to = None,
+        calculate_fid = True,
+        fid_batch_size = None,
+        inception_block_idx = 2048,
+        max_grad_norm = 1.,
+        num_fid_samples = 50000,
+        save_best_and_latest_only = False,
+        tensorboard_log = None
+    ):
+        super().__init__()
+
+        # accelerator
+
+        ipg_handler = InitProcessGroupKwargs(
+                    timeout=timedelta(hours=12),
+                    )
+
+
+        self.accelerator = Accelerator(
+            kwargs_handlers=[ipg_handler],
+            split_batches = split_batches,
+            mixed_precision = mixed_precision_type if amp else 'no'
+        )
+
+        if tensorboard_log is not None and self.accelerator.is_main_process:
+            self.tensor_writer = SummaryWriter(log_dir=tensorboard_log)
+        else:
+            self.tensor_writer = None
+
+
+        # model
+
+        self.model = diffusion_model
+        self.channels = diffusion_model.channels
+        is_ddim_sampling = diffusion_model.is_ddim_sampling
+
+        # default convert_image_to depending on channels
+
+        if not exists(convert_image_to):
+            convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
+
+        # sampling and training hyperparameters
+
+        assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
+        self.num_samples = num_samples
+        self.save_and_sample_every = save_and_sample_every
+
+        self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
+
+        self.train_num_steps = train_num_steps
+        self.image_size = diffusion_model.image_size
+
+        self.max_grad_norm = max_grad_norm
+        # dataset and dataloader
+
+        # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        self.ds = dataset
+
+        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+
+        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+
+        dl = self.accelerator.prepare(dl)
+        self.dl = cycle(dl)
+
+        # optimizer
+
+        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+
+        # for logging results in a folder periodically
+
+        if self.accelerator.is_main_process:
+            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+            self.ema.to(self.device)
+
+        if results_folder is None:
+            self.result_temp_folder = tempfile.TemporaryDirectory()
+            self.results_folder = Path(self.result_temp_folder.name)
+        else:
+            self.results_folder = Path(results_folder)
+            self.results_folder.mkdir(exist_ok = True)
+
+        # step counter state
+
+        self.step = 0
+
+        # prepare model, dataloader, optimizer with accelerator
+
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+
+        # FID-score computation
+
+        self.calculate_fid = calculate_fid and self.accelerator.is_main_process
+
+        if self.calculate_fid:
+            from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
+            if fid_batch_size is None:
+                self.fid_batch_size = train_batch_size
+            else:
+                self.fid_batch_size = fid_batch_size
+            self.fid_batch_size = max(self.fid_batch_size, train_batch_size)
+
+            if not is_ddim_sampling:
+                self.accelerator.print(
+                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
+                    "Consider using DDIM sampling to save time."
+                )
+
+            self.fid_scorer = FIDEvaluation(
+                batch_size=self.fid_batch_size,
+                dl=self.dl,
+                sampler=self.ema.ema_model,
+                channels=self.channels,
+                accelerator=self.accelerator,
+                stats_dir=self.results_folder,
+                device=self.device,
+                num_fid_samples=num_fid_samples,
+                inception_block_idx=inception_block_idx
+            )
+
+        if save_best_and_latest_only:
+            assert calculate_fid, "`calculate_fid` must be True to provide a means for model evaluation for `save_best_and_latest_only`."
+            self.best_fid = 1e10 # infinite
+
+        self.save_best_and_latest_only = save_best_and_latest_only
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    def save(self, milestone):
+        if not self.accelerator.is_local_main_process:
+            return
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            'version': __version__
+        }
+
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
+    def load(self, milestone):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device, weights_only=True)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        if self.accelerator.is_main_process:
+            self.ema.load_state_dict(data["ema"])
+
+        if 'version' in data:
+            print(f"loading from version {data['version']}")
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
+
+    def train(self):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+
+            while self.step < self.train_num_steps:
+                self.model.train()
+
+                total_loss = 0.
+
+                for _ in range(self.gradient_accumulate_every):
+                    data, cond = next(self.dl)
+                    data = data.to(device)
+                    cond = cond.to(device)
+
+                    with self.accelerator.autocast():
+                        loss = self.model(data, classes=cond)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+
+                    self.accelerator.backward(loss)
+
+                pbar.set_description(f'loss: {total_loss:.4f}')
+                if self.tensor_writer is not None:
+                    self.tensor_writer.add_scalar('train loss', total_loss, self.step)
+                accelerator.wait_for_everyone()
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.opt.step()
+                self.opt.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    self.ema.update()
+
+                    if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
+                        self.ema.ema_model.eval()
+
+                        with torch.inference_mode():
+                            milestone = self.step // self.save_and_sample_every
+                            batches = num_to_groups(self.num_samples, self.batch_size)
+
+                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+
+                        all_images = torch.cat(all_images_list, dim = 0)
+
+                        if self.tensor_writer is not None:
+                            image_grid = utils.make_grid(all_images)
+                            self.tensor_writer.add_image('image', img_tensor=image_grid, global_step=self.step)
+                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+
+                        # whether to calculate fid
+
+                        if self.calculate_fid:
+                            fid_score = self.fid_scorer.fid_score()
+                            accelerator.print(f'fid_score: {fid_score}')
+                            if self.tensor_writer is not None:
+                                self.tensor_writer.add_scalar('fid', fid_score, self.step)
+
+                        if self.save_best_and_latest_only:
+                            if self.best_fid > fid_score:
+                                self.best_fid = fid_score
+                                self.save("best")
+                            self.save("latest")
+                        else:
+                            self.save(milestone)
+
+                if self.tensor_writer is not None:
+                    self.tensor_writer.flush()
+                pbar.update(1)
+
+        accelerator.print('training complete')
+
+    def __del__(self):
+        if self.tensor_writer is not None:
+            self.tensor_writer.close()
+
 
 # example
 
