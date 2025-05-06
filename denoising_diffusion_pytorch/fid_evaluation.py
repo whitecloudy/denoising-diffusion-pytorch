@@ -28,6 +28,7 @@ class FIDEvaluation:
         channels=3,
         accelerator=None,
         stats_dir="./results",
+        dataset_dir="./results",
         device="cuda",
         num_fid_samples=50000,
         inception_block_idx=2048,
@@ -44,6 +45,7 @@ class FIDEvaluation:
         block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[inception_block_idx]
         self.inception_v3 = InceptionV3([block_idx]).to(device)
         self.dataset_stats_loaded = False
+        self.dataset_dir = dataset_dir
 
     def calculate_inception_features(self, samples):
         if self.channels == 1:
@@ -58,7 +60,7 @@ class FIDEvaluation:
         return features
 
     def load_or_precalc_dataset_stats(self):
-        path = os.path.join(self.stats_dir, "dataset_stats")
+        path = os.path.join(self.dataset_dir, "dataset_stats")
         try:
             ckpt = np.load(path + ".npz")
             self.m2, self.s2 = ckpt["m2"], ckpt["s2"]
@@ -101,7 +103,7 @@ class FIDEvaluation:
         for batch in tqdm(batches):
             fake_samples = self.sampler.sample(batch_size=batch)
             fake_features = self.calculate_inception_features(fake_samples)
-            stacked_fake_features.append(fake_features)
+            stacked_fake_features.append(fake_features.cpu())
         stacked_fake_features = torch.cat(stacked_fake_features, dim=0).cpu().numpy()
         m1 = np.mean(stacked_fake_features, axis=0)
         s1 = np.cov(stacked_fake_features, rowvar=False)
