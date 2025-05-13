@@ -34,6 +34,15 @@ from tqdm.auto import tqdm
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 # helpers functions
+def cal_SNR(predict, truth):
+    # Recombine the real and imaginary parts to form complex values
+    real_imag_dim_line = predict.shape[1]//2
+    predict_complex = (predict[:,:real_imag_dim_line,:,:] + 1j * predict[:,real_imag_dim_line:,:,:])
+    truth_complex = (truth[:,:real_imag_dim_line,:,:] + 1j * truth[:,real_imag_dim_line:,:,:])
+    PS = torch.sum(torch.abs(truth_complex)**2, dim=(-1, -2, -3))  # power of signal
+    PN = torch.sum(torch.abs(predict_complex - truth_complex)**2, dim=(-1, -2, -3))  # power of noise
+    ratio = PS / PN
+    return 10 * torch.log10(ratio)
 
 def exists(x):
     return x is not None
@@ -123,9 +132,10 @@ class Residual(nn.Module):
     def forward(self, x, *args, **kwargs):
         return self.fn(x, *args, **kwargs) + x
 
-def Upsample(dim, dim_out = None):
+def Upsample(dim, Up_size, dim_out = None):
     return nn.Sequential(
-        nn.Upsample(scale_factor = 2, mode = 'nearest'),
+        # nn.Upsample(scale_factor = 2, mode = 'nearest'),
+        nn.Upsample(size=Up_size, mode = 'nearest'),
         nn.Conv2d(dim, default(dim_out, dim), 3, padding = 1)
     )
 
@@ -291,7 +301,7 @@ class Unet(nn.Module):
     def __init__(
         self,
         dim,
-        num_classes,
+        condition_channel,
         cond_drop_prob = 0.5,
         init_dim = None,
         out_dim = None,
@@ -324,6 +334,9 @@ class Unet(nn.Module):
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
+        h_w_list = []
+        for i in range(len(in_out)-1):
+            h_w_list.append((condition_channel[1] // (2 ** i), condition_channel[2] // (2 ** i)))
         # time embeddings
 
         time_dim = dim * 4
@@ -345,16 +358,21 @@ class Unet(nn.Module):
         )
 
         # class embeddings
-        self.num_classes = num_classes
-        self.classes_emb = nn.Embedding(num_classes, dim)
-        self.null_classes_emb = nn.Parameter(torch.randn(dim))
+        self.condition_channel = condition_channel
+        self.classes_emb = nn.Sequential(
+            Downsample(self.condition_channel[0], dim//2),
+            nn.GELU(),
+            Downsample(dim//2, dim//4),
+            nn.Flatten()
+        )
+        classes_emb_out_dim = dim//4 * (self.condition_channel[1] // 4) * (self.condition_channel[2] // 4)
+        self.null_classes_emb = nn.Parameter(torch.randn(classes_emb_out_dim))
 
         classes_dim = dim * 4
 
         self.classes_mlp = nn.Sequential(
-            nn.Linear(dim, classes_dim),
             nn.GELU(),
-            nn.Linear(classes_dim, classes_dim)
+            nn.Linear(classes_emb_out_dim, classes_dim)
         )
 
         # layers
@@ -385,7 +403,7 @@ class Unet(nn.Module):
                 ResnetBlock(dim_out + dim_in, dim_out, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
                 ResnetBlock(dim_out + dim_in, dim_out, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
                 Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                Upsample(dim_out, dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
+                Upsample(dim_out, h_w_list.pop(), dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
             ]))
 
         default_out_dim = channels * (1 if not learned_variance else 2)
@@ -469,7 +487,6 @@ class Unet(nn.Module):
             x = block2(x, t, c)
             x = attn(x)
             h.append(x)
-
             x = downsample(x)
 
         x = self.mid_block1(x, t, c)
@@ -720,7 +737,6 @@ class GaussianDiffusion(nn.Module):
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             img, x_start = self.p_sample(img, t, classes, cond_scale, rescaled_phi)
 
-        img = unnormalize_to_zero_to_one(img)
         return img
 
     @torch.inference_mode()
@@ -755,20 +771,19 @@ class GaussianDiffusion(nn.Module):
                   c * pred_noise + \
                   sigma * noise
 
-        img = unnormalize_to_zero_to_one(img)
         return img
 
     @torch.inference_mode()
     def sample_with_class(self, classes, cond_scale = 6., rescaled_phi = 0.7):
         batch_size, image_size, channels = classes.shape[0], self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn(classes, (batch_size, channels, image_size, image_size), cond_scale, rescaled_phi)
+        return sample_fn(classes, (batch_size, channels, image_size[0], image_size[1]), cond_scale, rescaled_phi)
 
-    # sample with random classes
-    @torch.inference_mode()
-    def sample(self, batch_size = 16, cond_scale = 6., rescaled_phi = 0.7):
-        classes = torch.randint(0, self.model.num_classes, (batch_size,), device = self.device)
-        return self.sample_with_class(classes, cond_scale, rescaled_phi)
+    # # sample with random classes
+    # @torch.inference_mode()
+    # def sample(self, batch_size = 16, cond_scale = 6., rescaled_phi = 0.7):
+    #     classes = torch.randint(0, self.model.num_classes, (batch_size,), device = self.device)
+    #     return self.sample_with_class(classes, cond_scale, rescaled_phi)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, classes, t = None, lam = 0.5):
@@ -811,7 +826,6 @@ class GaussianDiffusion(nn.Module):
         # predict and take gradient step
 
         model_out = self.model(x, t, classes)
-
         if self.objective == 'pred_noise':
             target = noise
         elif self.objective == 'pred_x0':
@@ -830,10 +844,9 @@ class GaussianDiffusion(nn.Module):
 
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
-        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = normalize_to_neg_one_to_one(img)
         return self.p_losses(img, t, *args, **kwargs)
 
 class Trainer:
@@ -842,9 +855,10 @@ class Trainer:
         diffusion_model,
         dataset,
         *,
+        validation_dataset = None,
         train_batch_size = 16,
+        validation_batch_size = 16,
         gradient_accumulate_every = 1,
-        augment_horizontal_flip = True,
         train_lr = 1e-4,
         train_num_steps = 100000,
         ema_update_every = 10,
@@ -857,11 +871,11 @@ class Trainer:
         mixed_precision_type = 'fp16',
         split_batches = True,
         convert_image_to = None,
-        calculate_fid = True,
-        fid_batch_size = None,
-        inception_block_idx = 2048,
+        # calculate_fid = True,
+        # fid_batch_size = None,
+        # inception_block_idx = 2048,
         max_grad_norm = 1.,
-        num_fid_samples = 50000,
+        # num_fid_samples = 50000,
         save_best_and_latest_only = False,
         tensorboard_log = None,
         tensorboard_log_steps = 100,
@@ -926,6 +940,15 @@ class Trainer:
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
+        if self.accelerator.is_main_process:
+            self.val_ds = validation_dataset
+
+            if self.val_ds is not None:
+                self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
+            else:
+                self.val_dl = None
+        else:
+            self.val_dl = None
         # optimizer
 
         self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
@@ -951,39 +974,10 @@ class Trainer:
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
-        # FID-score computation
-
-        self.calculate_fid = calculate_fid and self.accelerator.is_main_process
-
-        if self.calculate_fid:
-            from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
-            if fid_batch_size is None:
-                self.fid_batch_size = train_batch_size
-            else:
-                self.fid_batch_size = fid_batch_size
-            self.fid_batch_size = max(self.fid_batch_size, train_batch_size)
-
-            if not is_ddim_sampling:
-                self.accelerator.print(
-                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
-                    "Consider using DDIM sampling to save time."
-                )
-
-            self.fid_scorer = FIDEvaluation(
-                batch_size=self.fid_batch_size,
-                dl=self.dl,
-                sampler=self.ema.ema_model,
-                channels=self.channels,
-                accelerator=self.accelerator,
-                stats_dir=self.results_folder,
-                device=self.device,
-                num_fid_samples=num_fid_samples,
-                inception_block_idx=inception_block_idx
-            )
+        self.validation_batch_size = validation_batch_size
 
         if save_best_and_latest_only:
-            assert calculate_fid, "`calculate_fid` must be True to provide a means for model evaluation for `save_best_and_latest_only`."
-            self.best_fid = 1e10 # infinite
+            self.best_SNR = 1e10 # infinite
 
         self.save_best_and_latest_only = save_best_and_latest_only
 
@@ -1029,13 +1023,12 @@ class Trainer:
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
+        total_loss = 0.
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
                 self.model.train()
-
-                total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
                     data, cond = next(self.dl)
@@ -1049,18 +1042,22 @@ class Trainer:
 
                     self.accelerator.backward(loss)
 
-                pbar.set_description(f'loss: {total_loss:.4f}')
+                print_loss = total_loss/(self.step % self.tensor_board_log_steps+1)
+                pbar.set_description(f'loss: {print_loss:.4f}')
                 if (self.tensor_writer is not None) and (self.step % self.tensor_board_log_steps == 0):
-                    self.tensor_writer.add_scalar('train loss', total_loss, self.step)
+                    self.tensor_writer.add_scalar('train loss', total_loss/self.tensor_board_log_steps, self.step)
+                    total_loss = 0.
+
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                 self.opt.step()
                 self.opt.zero_grad()
+                self.step += 1
+                pbar.update(1)
 
                 accelerator.wait_for_everyone()
 
-                self.step += 1
                 if accelerator.is_main_process:
                     self.ema.update()
 
@@ -1069,37 +1066,41 @@ class Trainer:
 
                         with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
-
-                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
-
-                        all_images = torch.cat(all_images_list, dim = 0)
-
-                        if self.tensor_writer is not None:
-                            image_grid = utils.make_grid(all_images)
-                            self.tensor_writer.add_image('image', img_tensor=image_grid, global_step=self.step)
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
 
                         # whether to calculate fid
+                        if self.val_dl is not None:
+                            SNR_list = []
+                            for data, cond in tqdm(self.val_dl, total= len(self.val_dl), desc = 'validation loop'):
+                                data = data.to(device)
+                                cond = cond.to(device)
 
-                        if self.calculate_fid:
-                            fid_score = self.fid_scorer.fid_score()
-                            accelerator.print(f'fid_score: {fid_score}')
+                                predict = self.ema.ema_model.sample_with_class(
+                                    classes = cond,
+                                )
+
+                                SNR = cal_SNR(predict, data)
+                                SNR_list.append(SNR)
+                                if len(SNR_list) >= 2:
+                                    break
+                            SNR = torch.mean(torch.stack(SNR_list)).item()
+
+                            accelerator.print(f'SNR: {SNR:.2f}')
                             if self.tensor_writer is not None:
-                                self.tensor_writer.add_scalar('fid', fid_score, self.step)
+                                self.tensor_writer.add_scalar('SNR', SNR, self.step)
 
-                        if self.save_best_and_latest_only:
-                            if self.best_fid > fid_score:
-                                self.best_fid = fid_score
-                                self.save("best")
-                            self.save("latest")
-                        else:
-                            self.save(milestone)
-                accelerator.wait_for_everyone()
-                
+                            if self.save_best_and_latest_only:
+                                if self.best_SNR > SNR:
+                                    self.best_SNR = SNR
+                                    self.save("best")
+                                self.save("latest")
+                            else:
+                                self.save(milestone)
+                            
                 if self.tensor_writer is not None:
                     self.tensor_writer.flush()
-                pbar.update(1)
+
+                accelerator.wait_for_everyone()
+                
 
         accelerator.print('training complete')
 
@@ -1110,42 +1111,42 @@ class Trainer:
 
 # example
 
-if __name__ == '__main__':
-    num_classes = 10
+# if __name__ == '__main__':
+#     num_classes = 10
 
-    model = Unet(
-        dim = 64,
-        dim_mults = (1, 2, 4, 8),
-        num_classes = num_classes,
-        cond_drop_prob = 0.5
-    )
+#     model = Unet(
+#         dim = 64,
+#         dim_mults = (1, 2, 4, 8),
+#         num_classes = num_classes,
+#         cond_drop_prob = 0.5
+#     )
 
-    diffusion = GaussianDiffusion(
-        model,
-        image_size = 128,
-        timesteps = 1000
-    ).cuda()
+#     diffusion = GaussianDiffusion(
+#         model,
+#         image_size = 128,
+#         timesteps = 1000
+#     ).cuda()
 
-    training_images = torch.randn(8, 3, 128, 128).cuda() # images are normalized from 0 to 1
-    image_classes = torch.randint(0, num_classes, (8,)).cuda()    # say 10 classes
+#     training_images = torch.randn(8, 3, 128, 128).cuda() # images are normalized from 0 to 1
+#     image_classes = torch.randint(0, num_classes, (8,)).cuda()    # say 10 classes
 
-    loss = diffusion(training_images, classes = image_classes)
-    loss.backward()
+#     loss = diffusion(training_images, classes = image_classes)
+#     loss.backward()
 
-    # do above for many steps
+#     # do above for many steps
 
-    sampled_images = diffusion.sample(
-        classes = image_classes,
-        cond_scale = 6.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
-    )
+#     sampled_images = diffusion.sample(
+#         classes = image_classes,
+#         cond_scale = 6.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
+#     )
 
-    sampled_images.shape # (8, 3, 128, 128)
+#     sampled_images.shape # (8, 3, 128, 128)
 
-    # interpolation
+#     # interpolation
 
-    interpolate_out = diffusion.interpolate(
-        training_images[:1],
-        training_images[:1],
-        image_classes[:1]
-    )
+#     interpolate_out = diffusion.interpolate(
+#         training_images[:1],
+#         training_images[:1],
+#         image_classes[:1]
+#     )
 
