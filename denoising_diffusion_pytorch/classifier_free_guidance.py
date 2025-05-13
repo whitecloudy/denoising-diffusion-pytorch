@@ -852,7 +852,7 @@ class Trainer:
         adam_betas = (0.9, 0.99),
         save_and_sample_every = 1000,
         num_samples = 25,
-        results_folder = None,
+        results_folder = "./results",
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
@@ -863,7 +863,8 @@ class Trainer:
         max_grad_norm = 1.,
         num_fid_samples = 50000,
         save_best_and_latest_only = False,
-        tensorboard_log = None
+        tensorboard_log = None,
+        tensorboard_log_steps = 100,
     ):
         super().__init__()
 
@@ -880,6 +881,8 @@ class Trainer:
             mixed_precision = mixed_precision_type if amp else 'no'
         )
 
+        # prepare tensorboard
+        self.tensor_board_log_steps = tensorboard_log_steps
         if tensorboard_log is not None and self.accelerator.is_main_process:
             self.tensor_writer = SummaryWriter(log_dir=tensorboard_log)
         else:
@@ -1047,7 +1050,7 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
-                if self.tensor_writer is not None:
+                if (self.tensor_writer is not None) and (self.step % self.tensor_board_log_steps == 0):
                     self.tensor_writer.add_scalar('train loss', total_loss, self.step)
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1092,7 +1095,8 @@ class Trainer:
                             self.save("latest")
                         else:
                             self.save(milestone)
-
+                accelerator.wait_for_everyone()
+                
                 if self.tensor_writer is not None:
                     self.tensor_writer.flush()
                 pbar.update(1)
