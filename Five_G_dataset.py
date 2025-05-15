@@ -45,11 +45,11 @@ class Five_G_dataset(Dataset):
     def __getitem__(self, idx):
         filename = self.data_filenames.iloc[idx]["filename"]
         # (Time slot, Node, Subcarrier)
-        loaded_data = np.load(filename)
-        
-        # (Node, Time slot, Subcarrier)
-        data = np.transpose(loaded_data['data'].astype(np.complex64), (1, 0, 2))
-        cond = np.transpose(loaded_data['cond'].astype(np.complex64), (1, 0, 2))
+
+        with np.load(filename) as loaded_data:
+            # (Node, Time slot, Subcarrier)
+            data = np.transpose(loaded_data['data'].astype(np.complex64), (1, 0, 2))
+            cond = np.transpose(loaded_data['cond'].astype(np.complex64), (1, 0, 2))
 
         if self.return_complex:
             return torch.from_numpy(data), torch.from_numpy(cond)

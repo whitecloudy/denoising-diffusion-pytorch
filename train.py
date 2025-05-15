@@ -16,10 +16,11 @@ import torch.nn.functional as F
 from denoising_diffusion_pytorch.classifier_free_guidance import Downsample, Block
 
 def __main__():
-    datafiles = ["../ssddata/RENEW/ArgosCSI-96x8-2016-05-01-06-38-03-2.4GHz-static"]
+    training_datafiles = ['../ssddata/RENEW/ArgosCSI-96x8-2016-05-01-06-57-58-2.4GHz-continuousmobile', '../ssddata/RENEW/ArgosCSI-96x8-2016-11-04-05-37-37_2.4GHz_track_left_to_right_NLOS']
+    validation_datafiles = ["../ssddata/RENEW/ArgosCSI-96x8-2016-05-01-06-38-03-2.4GHz-static"]
 
-    dataset = Five_G_dataset.Five_G_dataset(data_path=datafiles, return_complex=False)
-    val_dataset = Five_G_dataset.Five_G_dataset(data_path=datafiles, return_complex=False)
+    dataset = Five_G_dataset.Five_G_dataset(data_path=training_datafiles, return_complex=False)
+    val_dataset = Five_G_dataset.Five_G_dataset(data_path=validation_datafiles, return_complex=False)
 
     model = Unet(
         dim = 128,
@@ -34,7 +35,7 @@ def __main__():
         objective = 'pred_noise',
         image_size = (14, 26),
         beta_schedule='linear',
-        timesteps = 100,    # number of steps
+        timesteps = 1000,    # number of steps
     )
 
     # classes_emb = nn.Sequential(
@@ -61,17 +62,18 @@ def __main__():
                     dataset,
                     validation_dataset=val_dataset,
                     train_batch_size = 128,
-                    validation_batch_size= 256,
+                    validation_batch_size= 512,
                     train_lr = 2e-4,
                     train_num_steps = 800000,         # total training steps
                     gradient_accumulate_every = 1,    # gradient accumulation steps
                     ema_decay = 0.9999,                # exponential moving average decay
                     amp = False,                       # turn on mixed precision
-                    save_and_sample_every=10,       # save and sample every 1000 steps
+                    save_and_sample_every=25000,       # save and sample every 1000 steps
                     save_best_and_latest_only=True,   # only save the best and the latest model
                     tensorboard_log="./log/snr_test",             # log training to tensorboard
-                    tensorboard_log_steps=50,         # log training to tensorboard every 100 steps
+                    tensorboard_log_steps=64,         # log training to tensorboard every 100 steps
                     )
+    torch.manual_seed(0)
     trainer.train()
     # # after a lot of training
 
