@@ -15,7 +15,7 @@ class Five_G_dataset(Dataset):
     Returns:
         complex data (torch.tensor): Uplink data(Node, Time slot, Subcarrier), Downlink data(Node, Time slot, Subcarrier)
     """
-    def __init__(self, data_path, return_complex=True, transform=None):
+    def __init__(self, data_path, self_normalize=True, return_complex=True, transform=None):
         super().__init__()
         self.data_filenames = []
 
@@ -31,6 +31,7 @@ class Five_G_dataset(Dataset):
         self.data_filenames = pd.DataFrame(self.data_filenames, columns=['filename'])
 
         self.transform = transform
+        self.self_normalize = self_normalize
         self.return_complex = return_complex
 
         # if dtype is None:
@@ -39,9 +40,54 @@ class Five_G_dataset(Dataset):
         #     else:
         #         self.dtype = torch.float32
 
+    @staticmethod
+    def complex_to_real(data : torch.tensor):
+        """
+        Convert complex data to real data.
+        Args:
+            data (torch.tensor): Complex data (Node, Time slot, Subcarrier)
+        Returns:
+            real_data (torch.tensor): Real data (2*Node, Time slot, Subcarrier)
+        """
+        real_data = torch.cat((data.real, data.imag), dim=-3)
+        return real_data
+    
+    @staticmethod
+    def real_to_complex(data : torch.tensor):
+        """
+        Convert real data to complex data.
+        Args:
+            data (torch.tensor): Real data (2*Node, Time slot, Subcarrier)
+        Returns:
+            complex_data (torch.tensor): Complex data (Node, Time slot, Subcarrier)
+        """
+        assert data.shape[-3] % 2 == 0, "The first dimension of the data should be even"
+        # Split the data into real and imaginary parts
+        real_imag_data = torch.split(data, data.shape[-3] // 2, dim=-3)
+        # Concatenate the real and imaginary parts to form complex data
+        complex_data = real_imag_data[0] + 1j * real_imag_data[1]
+        return complex_data
+    
+    @staticmethod
+    def normalize(data : torch.tensor, cond : torch.tensor):
+        """
+        Normalize the data and condition.
+        Args:
+            data (torch.tensor): Data (Node, Time slot, Subcarrier)
+            cond (torch.tensor): Condition (Node, Time slot, Subcarrier)
+        Returns:
+            normalized_data (torch.tensor): Normalized data
+            normalized_cond (torch.tensor): Normalized condition
+        """
+        cond_std = cond.std()
+        normalized_data = data / cond_std
+        normalized_cond = cond / cond_std
+        return normalized_data, normalized_cond
+
     def __len__(self):
         return len(self.data_filenames)
 
+    @torch.inference_mode()
     def __getitem__(self, idx):
         filename = self.data_filenames.iloc[idx]["filename"]
         # (Time slot, Node, Subcarrier)
@@ -51,27 +97,30 @@ class Five_G_dataset(Dataset):
             data = np.transpose(loaded_data['data'].astype(np.complex64), (1, 0, 2))
             cond = np.transpose(loaded_data['cond'].astype(np.complex64), (1, 0, 2))
 
-        if self.return_complex:
-            return torch.from_numpy(data), torch.from_numpy(cond)
-        else:
-            data = np.concatenate((data.real, data.imag), axis=0)
-            cond = np.concatenate((cond.real, cond.imag), axis=0)
-            return torch.from_numpy(data), torch.from_numpy(cond)
+        data = torch.from_numpy(data)
+        cond = torch.from_numpy(cond)
+
+        if self.self_normalize:
+            data, cond = self.normalize(data, cond)
+
+        if not self.return_complex:
+            data = self.complex_to_real(data)
+            cond = self.complex_to_real(cond)
+
+        return data, cond
     
 if __name__ == "__main__":
-    test_dataset = Five_G_dataset(["../ssddata/RENEW/ArgosCSI-96x8-2016-05-01-06-38-03-2.4GHz-static"], return_complex=False)
+    test_dataset = Five_G_dataset(["../ssddata/RENEW/ArgosCSI-96x8-2016-05-01-06-38-03-2.4GHz-static"], return_complex=True)
     from torch.utils.data import DataLoader
     from multiprocessing import cpu_count
     from accelerate import Accelerator
     import tqdm
-    dl = DataLoader(test_dataset, batch_size = 128, shuffle = True, pin_memory = True, num_workers = cpu_count())
-    accelerator = Accelerator(
-        mixed_precision = 'no'
-    )
-    dl = accelerator.prepare(dl)
-
-    for data, cond in tqdm.tqdm(dl, total=len(dl)):
-        if torch.any(torch.isnan(data)):
-            print("Data contains NaN values")
-        if torch.any(torch.isnan(cond)):
-            print("Condition contains NaN values")
+    dl = DataLoader(test_dataset, batch_size = 128, shuffle = False, pin_memory = True, num_workers = cpu_count())
+    for i, (data, cond) in enumerate(dl):
+        print(data.shape)
+        reald = test_dataset.complex_to_real(data)
+        print(reald.shape)
+        back2c = test_dataset.real_to_complex(reald)
+        print(back2c.shape)
+        print(data==back2c)
+        break
