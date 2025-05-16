@@ -26,6 +26,7 @@ from einops.layers.torch import Rearrange
 
 from denoising_diffusion_pytorch.version import __version__
 from accelerate import Accelerator, InitProcessGroupKwargs
+import accelerate
 
 from tqdm.auto import tqdm
 
@@ -1024,12 +1025,11 @@ class Trainer:
         accelerator = self.accelerator
         device = accelerator.device
         total_loss = 0.
+        cum_loss = 0.
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-
             while self.step < self.train_num_steps:
                 self.model.train()
-
                 for _ in range(self.gradient_accumulate_every):
                     data, cond = next(self.dl)
                     data = data.to(device)
@@ -1042,8 +1042,11 @@ class Trainer:
 
                     self.accelerator.backward(loss)
 
-                print_loss = total_loss/(self.step % self.tensor_board_log_steps+1)
-                pbar.set_description(f'loss: {print_loss:.4f}')
+                cum_loss  = cum_loss*0.9 + loss.item()*0.1
+                pbar.set_description(f'loss: {cum_loss:.4f}')
+
+                self.step += 1
+
                 if (self.tensor_writer is not None) and (self.step % self.tensor_board_log_steps == 0):
                     self.tensor_writer.add_scalar('train loss', total_loss/self.tensor_board_log_steps, self.step)
                     total_loss = 0.
@@ -1053,11 +1056,11 @@ class Trainer:
 
                 self.opt.step()
                 self.opt.zero_grad()
-                self.step += 1
-                pbar.update(1)
 
                 accelerator.wait_for_everyone()
 
+                pbar.update(1)
+                # TODO: make this test code to work with multiple GPUs
                 if accelerator.is_main_process:
                     self.ema.update()
 
@@ -1080,9 +1083,7 @@ class Trainer:
 
                                 SNR = cal_SNR(predict, data)
                                 SNR_list.append(SNR)
-                                if len(SNR_list) >= 2:
-                                    break
-                            SNR = torch.mean(torch.stack(SNR_list)).item()
+                            SNR = torch.mean(torch.cat(SNR_list, dim=0)).item()
 
                             accelerator.print(f'SNR: {SNR:.2f}')
                             if self.tensor_writer is not None:
@@ -1096,11 +1097,10 @@ class Trainer:
                             else:
                                 self.save(milestone)
                             
-                if self.tensor_writer is not None:
-                    self.tensor_writer.flush()
+                    if self.tensor_writer is not None:
+                        self.tensor_writer.flush()
 
                 accelerator.wait_for_everyone()
-                
 
         accelerator.print('training complete')
 
