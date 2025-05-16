@@ -35,6 +35,7 @@ from tqdm.auto import tqdm
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 # helpers functions
+@torch.inference_mode()
 def cal_SNR(predict, truth):
     # Recombine the real and imaginary parts to form complex values
     real_imag_dim_line = predict.shape[1]//2
@@ -548,7 +549,8 @@ class GaussianDiffusion(nn.Module):
         offset_noise_strength = 0.,
         min_snr_loss_weight = False,
         min_snr_gamma = 5,
-        use_cfg_plus_plus = False # https://arxiv.org/pdf/2406.08070
+        use_cfg_plus_plus = False, # https://arxiv.org/pdf/2406.08070
+        tqdm_disable = False,
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
@@ -576,6 +578,7 @@ class GaussianDiffusion(nn.Module):
 
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
+        self.tqdm_disable = tqdm_disable
 
         # use cfg++ when ddim sampling
 
@@ -735,7 +738,7 @@ class GaussianDiffusion(nn.Module):
 
         x_start = None
 
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps, disable=self.tqdm_disable):
             img, x_start = self.p_sample(img, t, classes, cond_scale, rescaled_phi)
 
         return img
@@ -752,7 +755,7 @@ class GaussianDiffusion(nn.Module):
 
         x_start = None
 
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step', disable=self.tqdm_disable):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_x_start = clip_denoised)
 
@@ -798,7 +801,7 @@ class GaussianDiffusion(nn.Module):
 
         img = (1 - lam) * xt1 + lam * xt2
 
-        for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
+        for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t, disable=self.tqdm_disable):
             img, _ = self.p_sample(img, i, classes)
 
         return img
@@ -866,7 +869,6 @@ class Trainer:
         ema_decay = 0.995,
         adam_betas = (0.9, 0.99),
         save_and_sample_every = 1000,
-        num_samples = 25,
         results_folder = "./results",
         amp = False,
         mixed_precision_type = 'fp16',
@@ -907,8 +909,8 @@ class Trainer:
         # model
 
         self.model = diffusion_model
-        self.channels = diffusion_model.channels
-        is_ddim_sampling = diffusion_model.is_ddim_sampling
+        self.channels = self.model.channels
+        is_ddim_sampling = self.model.is_ddim_sampling
 
         # default convert_image_to depending on channels
 
@@ -917,8 +919,6 @@ class Trainer:
 
         # sampling and training hyperparameters
 
-        assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
-        self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
 
         self.batch_size = train_batch_size
@@ -926,12 +926,10 @@ class Trainer:
         assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
 
         self.train_num_steps = train_num_steps
-        self.image_size = diffusion_model.image_size
+        self.image_size = self.model.image_size
 
         self.max_grad_norm = max_grad_norm
-        # dataset and dataloader
-
-        # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        # preparing Training dataset and dataloader
         self.ds = dataset
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
@@ -941,23 +939,39 @@ class Trainer:
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
-        if self.accelerator.is_main_process:
-            self.val_ds = validation_dataset
+        # if self.accelerator.is_main_process:
+        #     self.val_ds = validation_dataset
 
-            if self.val_ds is not None:
-                self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
-            else:
-                self.val_dl = None
+        #     if self.val_ds is not None:
+        #         self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
+        #     else:
+        #         self.val_dl = None
+        # else:
+        #     self.val_dl = None
+
+        # prepare validation dataset and dataloader
+        self.val_ds = validation_dataset
+        if self.val_ds is not None:
+            self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
+            self.val_dl_len = len(self.val_dl)
+            self.val_dl = self.accelerator.prepare(self.val_dl)
+
+            self.dummy_ema_model = copy.deepcopy(self.model)
+            self.dummy_ema_model.eval()
+            self.dummy_ema_model.requires_grad_(False)
+            self.dummy_ema_model.to(self.device)
+            self.dummy_ema_model.tqdm_disable = not self.accelerator.is_main_process
         else:
             self.val_dl = None
+
         # optimizer
 
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+        self.opt = Adam(self.model.parameters(), lr = train_lr, betas = adam_betas)
 
         # for logging results in a folder periodically
 
         if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+            self.ema = EMA(self.model, beta = ema_decay, update_every = ema_update_every)
             self.ema.to(self.device)
 
         if results_folder is None:
@@ -1051,44 +1065,53 @@ class Trainer:
                     self.tensor_writer.add_scalar('train loss', total_loss/self.tensor_board_log_steps, self.step)
                     total_loss = 0.
 
-                accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                 self.opt.step()
                 self.opt.zero_grad()
 
-                accelerator.wait_for_everyone()
-
                 pbar.update(1)
-                # TODO: make this test code to work with multiple GPUs
                 if accelerator.is_main_process:
                     self.ema.update()
 
-                    if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
-                        self.ema.ema_model.eval()
-
-                        with torch.inference_mode():
-                            milestone = self.step // self.save_and_sample_every
-
-                        # whether to calculate fid
+                # Save and validate
+                if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
+                    with torch.inference_mode():
+                        # Validation
                         if self.val_dl is not None:
-                            SNR_list = []
-                            for data, cond in tqdm(self.val_dl, total= len(self.val_dl), desc = 'validation loop'):
+                            SNR_sum = torch.tensor(0.).to(device)
+
+                            # Broadcast ema model state dict
+                            if self.accelerator.is_main_process:
+                                dummy_ema_state = self.ema.ema_model.state_dict()
+                            else:
+                                dummy_ema_state = self.dummy_ema_model.state_dict()
+
+                            accelerate.utils.broadcast(dummy_ema_state)
+                            self.dummy_ema_model.load_state_dict(dummy_ema_state)
+
+                            # Validation loop
+                            for data, cond in tqdm(self.val_dl, total= len(self.val_dl), desc = 'validation loop', disable = not accelerator.is_main_process):
                                 data = data.to(device)
                                 cond = cond.to(device)
 
-                                predict = self.ema.ema_model.sample_with_class(
+                                predict = self.dummy_ema_model.sample_with_class(
                                     classes = cond,
                                 )
 
                                 SNR = cal_SNR(predict, data)
-                                SNR_list.append(SNR)
-                            SNR = torch.mean(torch.cat(SNR_list, dim=0)).item()
-
-                            accelerator.print(f'SNR: {SNR:.2f}')
-                            if self.tensor_writer is not None:
-                                self.tensor_writer.add_scalar('SNR', SNR, self.step)
-
+                                SNR_sum += torch.sum(SNR)
+                            
+                            gathered_SNR = accelerator.gather_for_metrics(SNR_sum)
+                            if accelerator.is_main_process:
+                                SNR = torch.sum(gathered_SNR).item() / self.val_dl_len
+                                accelerator.print(f'SNR: {SNR:.2f}')
+                                if self.tensor_writer is not None:
+                                    self.tensor_writer.add_scalar('SNR', SNR, self.step)
+                        
+                        # save model
+                        milestone = self.step // self.save_and_sample_every
+                        if self.accelerator.is_main_process:
                             if self.save_best_and_latest_only:
                                 if self.best_SNR > SNR:
                                     self.best_SNR = SNR
@@ -1096,17 +1119,18 @@ class Trainer:
                                 self.save("latest")
                             else:
                                 self.save(milestone)
-                            
-                    if self.tensor_writer is not None:
-                        self.tensor_writer.flush()
 
-                accelerator.wait_for_everyone()
+                        if self.tensor_writer is not None:
+                            self.tensor_writer.flush()
+
+                        accelerator.wait_for_everyone()
 
         accelerator.print('training complete')
 
     def __del__(self):
         if self.tensor_writer is not None:
             self.tensor_writer.close()
+        self.accelerator.end_training()
 
 
 # example
