@@ -57,6 +57,12 @@ def __main__():
     #         ]))
     
     # print(dataset[0][0].shape)
+
+    import datetime
+    now = datetime.datetime.now()
+    current_time = now.strftime("%Y-%m-%d_%H-%M-%S")
+    results_folder: str = "./results/"+current_time
+    tensorboard_log_name = './log/snr_test/'+current_time
     
     trainer = Trainer(diffusion, 
                     dataset,
@@ -65,12 +71,13 @@ def __main__():
                     validation_batch_size= 512,
                     train_lr = 2e-4,
                     train_num_steps = 800000,         # total training steps
+                    results_folder=results_folder, # folder to save results
                     gradient_accumulate_every = 1,    # gradient accumulation steps
                     ema_decay = 0.9999,                # exponential moving average decay
                     amp = False,                       # turn on mixed precision
                     save_and_sample_every=25000,       # save and sample every 1000 steps
                     save_best_and_latest_only=True,   # only save the best and the latest model
-                    tensorboard_log="./log/snr_test",             # log training to tensorboard
+                    tensorboard_log=tensorboard_log_name,             # log training to tensorboard
                     tensorboard_log_steps=64,         # log training to tensorboard every 100 steps
                     )
     torch.manual_seed(0)
