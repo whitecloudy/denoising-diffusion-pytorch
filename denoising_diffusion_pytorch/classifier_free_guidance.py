@@ -953,7 +953,7 @@ class Trainer:
         self.val_ds = validation_dataset
         if self.val_ds is not None:
             self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
-            self.val_dl_len = len(self.val_dl)
+            self.val_dl_len = len(self.val_ds)
             self.val_dl = self.accelerator.prepare(self.val_dl)
 
             self.dummy_ema_model = copy.deepcopy(self.model)
