@@ -1,0 +1,1066 @@
+import math
+import copy
+from datetime import timedelta
+from pathlib import Path
+from random import random
+from functools import partial
+from collections import namedtuple
+from multiprocessing import cpu_count
+
+import tempfile
+import torch
+from torch import nn, einsum
+import torch.nn.functional as F
+from torch.amp import autocast
+from torch.utils.tensorboard import SummaryWriter, writer
+from torch.utils.data import Dataset, DataLoader
+
+from torch.optim import Adam
+from ema_pytorch import EMA
+
+
+from torchvision import transforms as T, utils
+
+from einops import rearrange, reduce, repeat, pack, unpack
+from einops.layers.torch import Rearrange
+
+from denoising_diffusion_pytorch.version import __version__
+from accelerate import Accelerator, InitProcessGroupKwargs
+import accelerate
+
+from tqdm.auto import tqdm
+
+import complex.complex_module as cm
+import numpy as np
+
+
+# constants
+
+ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
+
+# helpers functions
+@torch.inference_mode()
+def cal_SNR(predict, truth):
+    # Recombine the real and imaginary parts to form complex values
+    real_imag_dim_line = predict.shape[1]//2
+    predict_complex = (predict[:,:real_imag_dim_line,:,:] + 1j * predict[:,real_imag_dim_line:,:,:])
+    truth_complex = (truth[:,:real_imag_dim_line,:,:] + 1j * truth[:,real_imag_dim_line:,:,:])
+    PS = torch.sum(torch.abs(truth_complex)**2, dim=(-1, -2, -3))  # power of signal
+    PN = torch.sum(torch.abs(predict_complex - truth_complex)**2, dim=(-1, -2, -3))  # power of noise
+    ratio = PS / PN
+    return 10 * torch.log10(ratio)
+
+def exists(x):
+    return x is not None
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if callable(d) else d
+
+def identity(t, *args, **kwargs):
+    return t
+
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
+
+def divisible_by(numer, denom):
+    return (numer % denom) == 0
+
+def num_to_groups(num, divisor):
+    groups = num // divisor
+    remainder = num % divisor
+    arr = [divisor] * groups
+    if remainder > 0:
+        arr.append(remainder)
+    return arr
+
+
+def init_weight_norm(module):
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+
+
+def init_weight_zero(module):
+    if isinstance(module, nn.Linear):
+        nn.init.constant_(module.weight, 0)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+
+
+def init_weight_xavier(module):
+    if isinstance(module, nn.Linear):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+
+
+@torch.jit.script
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class DiffusionEmbedding(nn.Module):
+    def __init__(self, max_step, embed_dim=256, hidden_dim=256):
+        super().__init__()
+        self.register_buffer('embedding', self._build_embedding(
+            max_step, embed_dim), persistent=False)
+        self.projection = nn.Sequential(
+            cm.ComplexLinear(embed_dim, hidden_dim, bias=True),
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(hidden_dim, hidden_dim, bias=True),
+        )
+        self.hidden_dim = hidden_dim
+        self.apply(init_weight_norm)
+
+    def forward(self, t):
+        if t.dtype in [torch.int32, torch.int64]:
+            x = self.embedding[t]
+        else:
+            x = self._lerp_embedding(t)
+        return self.projection(x)
+
+    def _lerp_embedding(self, t):
+        low_idx = torch.floor(t).long()
+        high_idx = torch.ceil(t).long()
+        low = self.embedding[low_idx]
+        high = self.embedding[high_idx]
+        return low + (high - low) * (t - low_idx)
+
+    def _build_embedding(self, max_step, embed_dim):
+        steps = torch.arange(max_step).unsqueeze(1)  # [T, 1]
+        dims = torch.arange(embed_dim).unsqueeze(0)  # [1, E]
+        table = steps * torch.exp(-math.log(max_step)
+                                  * dims / embed_dim)  # [T, E]
+        table = torch.view_as_real(torch.exp(1j * table))
+        return table
+
+
+# TODO: Replace MLP with nn.Embedding
+class MLPConditionEmbedding(nn.Module):
+    def __init__(self, cond_dim, hidden_dim=256):
+        super().__init__()
+        self.projection = nn.Sequential(
+            cm.ComplexLinear(cond_dim, hidden_dim, bias=True),
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(hidden_dim, hidden_dim*4, bias=True),
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(hidden_dim*4, hidden_dim, bias=True),
+        )
+        self.apply(init_weight_norm)
+
+    def forward(self, c):
+        return self.projection(c)
+
+
+class PositionEmbedding(nn.Module):
+    def __init__(self, max_len, input_dim, hidden_dim):
+        super().__init__()
+        self.register_buffer('embedding', self._build_embedding(
+            max_len, hidden_dim), persistent=False)
+        self.projection = cm.ComplexLinear(input_dim, hidden_dim)
+        self.apply(init_weight_xavier)
+
+    def forward(self, x):
+        x = self.projection(x)
+        return cm.complex_mul(x, self.embedding.to(x.device))
+
+    def _build_embedding(self, max_len, hidden_dim):
+        steps = torch.arange(max_len).unsqueeze(1)  # [P,1]
+        dims = torch.arange(hidden_dim).unsqueeze(0)          # [1,E]
+        table = steps * torch.exp(-math.log(max_len)
+                                  * dims / hidden_dim)     # [P,E]
+        table = torch.view_as_real(torch.exp(1j * table))
+        return table
+
+
+class DiA(nn.Module):
+    def __init__(self, hidden_dim, num_heads, dropout, mlp_ratio=4.0, **block_kwargs):
+        super().__init__()
+        self.norm1 = cm.NaiveComplexLayerNorm(
+            hidden_dim, eps=1e-6, elementwise_affine=False)
+        self.s_attn = cm.ComplexMultiHeadAttention(
+            hidden_dim, hidden_dim, num_heads, dropout, bias=True, **block_kwargs)
+        self.norm2 = cm.NaiveComplexLayerNorm(
+            hidden_dim, eps=1e-6, elementwise_affine=False)
+        self.normc = cm.NaiveComplexLayerNorm(
+            hidden_dim, eps=1e-6, elementwise_affine=False)
+        self.x_attn = cm.ComplexMultiHeadAttention(
+            hidden_dim, hidden_dim, num_heads, dropout, bias=True, *block_kwargs)
+        self.norm3 = cm.NaiveComplexLayerNorm(
+            hidden_dim, eps=1e-6, elementwise_affine=False)
+        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            cm.ComplexLinear(hidden_dim, mlp_hidden_dim, bias=True),
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(mlp_hidden_dim, hidden_dim, bias=True),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(hidden_dim, 6*hidden_dim, bias=True)
+        )
+        self.apply(init_weight_xavier)
+        self.adaLN_modulation.apply(init_weight_zero)
+
+    def forward(self, x, t, c):
+        """
+        Embedding diffusion step t with adaptive layer-norm.
+        Embedding condition c with cross-attention.
+        - Input:\\
+          x, [B, N, H, 2], \\ 
+          t, [B, H, 2], \\
+          c, [B, N, H, 2], \\
+        """
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
+            t).chunk(6, dim=1)
+        mod_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = x + \
+            gate_msa.unsqueeze(
+                1) * self.s_attn(mod_x, mod_x, mod_x)
+        x = x + self.x_attn(queries=self.normc(c),
+                            keys=self.norm2(x), values=self.norm2(x))
+        x = x + \
+            gate_mlp.unsqueeze(
+                1) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
+        return x
+
+
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_dim, out_dim):
+        super().__init__()
+        self.norm = cm.NaiveComplexLayerNorm(
+            hidden_dim, eps=1e-6, elementwise_affine=False)
+        self.adaLN_modulation = nn.Sequential(
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(hidden_dim, 2*hidden_dim, bias=True)
+        )
+        self.linear = cm.ComplexLinear(hidden_dim, out_dim, bias=True)
+        self.apply(init_weight_zero)
+
+    def forward(self, x, t):
+        shift, scale = self.adaLN_modulation(t).chunk(2, dim=1)
+        x = x + modulate(self.norm(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
+class SpatialDiffusion(nn.Module):
+    """
+    Process each sample of a sequence.
+    Take CSI diffusion as an example.
+    - Input:\\
+      x, [B, S, A, 2], \\
+      t, [B], \\
+      c, [B, C, 2], \\
+    - Output:
+      n, [B, S*A, 2]
+    """
+
+    def __init__(self, params):
+        super().__init__()
+        self.learn_tfdiff = params.learn_tfdiff
+        self.num_block = params.num_spatial_block
+        self.input_dim = params.extra_dim[-1]  # A
+        self.input_len = params.extra_dim[-2]  # S
+        self.output_dim = self.input_dim * self.input_len  # S*A
+        self.hidden_dim = params.spatial_hidden_dim  # D
+        self.num_heads = params.num_heads  # H
+        self.max_step = params.max_step  # T
+        self.embed_dim = params.embed_dim  # E
+        self.cond_dim = params.cond_dim[-1]  # C
+        self.dropout = params.dropout
+        self.task_id = params.task_id
+        self.mlp_ratio = params.mlp_ratio
+        self.p_embed = PositionEmbedding(
+            self.input_len, self.input_dim, self.hidden_dim)
+        self.t_embed = DiffusionEmbedding(
+            self.max_step, self.embed_dim, self.hidden_dim)
+        self.c_embed = MLPConditionEmbedding(self.cond_dim, self.hidden_dim)
+        # A series of concatenated DiA blocks.
+        self.blocks = nn.ModuleList([
+            DiA(self.hidden_dim, self.num_heads, self.dropout, self.mlp_ratio) for _ in range(self.num_block)
+        ])
+        self.adaMLP = nn.Sequential(
+            # Flatten [B, S, A, 2] to [B, S*A, 2]
+            nn.Flatten(start_dim=1, end_dim=-2),
+            cm.ComplexLinear(self.input_len*self.hidden_dim, self.output_dim),
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(self.output_dim, self.output_dim),
+        )
+        self.adaMLP.apply(init_weight_xavier)
+
+    def forward(self, x, t, c):
+        x = self.p_embed(x)
+        t = self.t_embed(t)
+        c = self.c_embed(c)
+        for block in self.blocks:
+            x = block(x, t, c)
+        x = self.adaMLP(x)
+        return x
+
+
+class TimeFrequencyDiffusion(nn.Module):
+    """
+    Process the whole sequence.
+    Take CSI diffusion as an example.
+    - Input:\\
+      x, [B, N, S*A, 2], \\
+      t, [B], \\
+      c, [B, N, C, 2], \\
+    - Output:
+      n, [B, N, S*A, 2]
+    """
+
+    def __init__(self, params):
+        super().__init__()
+        self.learn_tfdiff = params.learn_tfdiff
+        self.num_block = params.num_tf_block
+        self.input_dim = np.prod(params.extra_dim)  # S*A
+        self.input_len = params.sample_rate  # N
+        self.output_dim = self.input_dim  # S*A
+        self.hidden_dim = params.tf_hidden_dim  # D
+        self.num_heads = params.num_heads  # H
+        self.max_step = params.max_step  # T
+        self.embed_dim = params.embed_dim  # E
+        self.cond_dim = np.prod(params.cond_dim)  # C
+        self.dropout = params.dropout
+        self.task_id = params.task_id
+        self.mlp_ratio = params.mlp_ratio
+        self.p_embed = PositionEmbedding(
+            self.input_len, self.input_dim, self.hidden_dim)
+        self.t_embed = DiffusionEmbedding(
+            self.max_step, self.embed_dim, self.hidden_dim)
+        self.c_embed = MLPConditionEmbedding(self.cond_dim, self.hidden_dim)
+        self.blocks = nn.ModuleList([
+            DiA(self.hidden_dim, self.num_heads, self.dropout, self.mlp_ratio) for _ in range(self.num_block)
+        ])
+        self.final_layer = FinalLayer(
+            self.hidden_dim, self.output_dim)
+
+    def forward(self, x, t, c):
+        x = self.p_embed(x)
+        t = self.t_embed(t)
+        c = c.reshape([-1, self.input_len, 2496, 2])
+        c = self.c_embed(c)
+        for block in self.blocks:
+            x = block(x, t, c)
+        x = self.final_layer(x, t)
+        return x
+
+
+class tfdiff_mimo(nn.Module):
+    """
+    Signal Modulation and Augmentation via Generative Diffusion Model.
+    Take CSI diffusion as an example.
+    - Input:\\
+      x, [B, N, S, A, 2], \\
+      t, [B], \\
+      c, [B, N, C, 2], \\
+    - Output:
+      n, [B, N, S, A, 2]
+    """
+
+    def __init__(self, params):
+        super().__init__()
+        self.params = params
+        self.task_id = params.task_id
+        self.sample_rate = params.sample_rate
+        self.extra_dim = params.extra_dim
+        self.cond_dim = params.cond_dim
+        self.spatial_dim = np.prod(self.extra_dim)
+        # N parallel SpatialDiffusion blocks.
+        self.spatial_block = SpatialDiffusion(self.params)
+        self.tf_block = TimeFrequencyDiffusion(self.params)
+
+    def forward(self, x, t, c):
+        t = t-1
+        x_s = x.reshape([-1]+self.extra_dim+[2])  # [B*N, S, A, 2] 
+        c_s = c.reshape([-1]+self.cond_dim+[2])  # [B*N, [C], 2]
+        x_s = self.spatial_block(x_s, t.repeat(
+            self.sample_rate), c_s)  # [B*N, S*A, 2]
+        x = x_s.reshape([-1, self.sample_rate] +
+                        [self.spatial_dim, 2])  # [B, N, S*A, 2]
+        x = self.tf_block(x, t, c)  # [B, N, S*A, 2]
+        x = x.reshape([-1, self.sample_rate] +
+                      self.extra_dim+[2])  # [B, N, S, A, 2]
+        return x
+
+
+# gaussian diffusion trainer class
+
+def extract(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+def linear_beta_schedule(timesteps):
+    scale = 1000 / timesteps
+    beta_start = scale * 0.0001
+    beta_end = scale * 0.02
+    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
+
+def cosine_beta_schedule(timesteps, s = 0.008):
+    """
+    cosine schedule
+    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+    """
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps, dtype = torch.float64)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
+
+class GaussianDiffusion(nn.Module):
+    def __init__(
+        self,
+        model,
+        *,
+        image_size,
+        timesteps = 1000,
+        sampling_timesteps = None,
+        objective = 'pred_noise',
+        beta_schedule = 'cosine',
+        ddim_sampling_eta = 1.,
+        offset_noise_strength = 0.,
+        min_snr_loss_weight = False,
+        min_snr_gamma = 5,
+        use_cfg_plus_plus = False, # https://arxiv.org/pdf/2406.08070
+        tqdm_disable = False,
+    ):
+        super().__init__()
+        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
+        assert not model.random_or_learned_sinusoidal_cond
+
+        self.model = model
+        self.channels = self.model.channels
+
+        self.image_size = image_size
+
+        self.objective = objective
+
+        assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
+
+        if beta_schedule == 'linear':
+            betas = linear_beta_schedule(timesteps)
+        elif beta_schedule == 'cosine':
+            betas = cosine_beta_schedule(timesteps)
+        else:
+            raise ValueError(f'unknown beta schedule {beta_schedule}')
+
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
+
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        self.tqdm_disable = tqdm_disable
+
+        # use cfg++ when ddim sampling
+
+        self.use_cfg_plus_plus = use_cfg_plus_plus
+
+        # sampling related parameters
+
+        self.sampling_timesteps = default(sampling_timesteps, timesteps) # default num sampling timesteps to number of timesteps at training
+
+        assert self.sampling_timesteps <= timesteps
+        self.is_ddim_sampling = self.sampling_timesteps < timesteps
+        self.ddim_sampling_eta = ddim_sampling_eta
+
+        # helper function to register buffer from float64 to float32
+
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+
+        register_buffer('posterior_variance', posterior_variance)
+
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+
+        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min =1e-20)))
+        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+
+        # offset noise strength - 0.1 was claimed ideal
+
+        self.offset_noise_strength = offset_noise_strength
+
+        # loss weight
+
+        snr = alphas_cumprod / (1 - alphas_cumprod)
+
+        maybe_clipped_snr = snr.clone()
+        if min_snr_loss_weight:
+            maybe_clipped_snr.clamp_(max = min_snr_gamma)
+
+        if objective == 'pred_noise':
+            loss_weight = maybe_clipped_snr / snr
+        elif objective == 'pred_x0':
+            loss_weight = maybe_clipped_snr
+        elif objective == 'pred_v':
+            loss_weight = maybe_clipped_snr / (snr + 1)
+
+        register_buffer('loss_weight', loss_weight)
+
+    @property
+    def device(self):
+        return self.betas.device
+
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def predict_noise_from_start(self, x_t, t, x0):
+        return (
+            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        )
+
+    def predict_v(self, x_start, t, noise):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
+        )
+
+    def predict_start_from_v(self, x_t, t, v):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
+        )
+
+    def q_posterior(self, x_start, x_t, t):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def model_predictions(self, x, t, classes, clip_x_start = False):
+        model_output, model_output_null = self.model.forward(x, t, classes)
+        maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
+
+        if self.objective == 'pred_noise':
+            pred_noise = model_output if not self.use_cfg_plus_plus else model_output_null
+
+            x_start = self.predict_start_from_noise(x, t, model_output)
+            x_start = maybe_clip(x_start)
+
+        elif self.objective == 'pred_x0':
+            x_start = model_output
+            x_start = maybe_clip(x_start)
+            x_start_for_pred_noise = x_start if not self.use_cfg_plus_plus else maybe_clip(model_output_null)
+
+            pred_noise = self.predict_noise_from_start(x, t, x_start_for_pred_noise)
+
+        elif self.objective == 'pred_v':
+            v = model_output
+            x_start = self.predict_start_from_v(x, t, v)
+            x_start = maybe_clip(x_start)
+
+            x_start_for_pred_noise = x_start
+            if self.use_cfg_plus_plus:
+                x_start_for_pred_noise = self.predict_start_from_v(x, t, model_output_null)
+                x_start_for_pred_noise = maybe_clip(x_start_for_pred_noise)
+
+            pred_noise = self.predict_noise_from_start(x, t, x_start_for_pred_noise)
+
+        return ModelPrediction(pred_noise, x_start)
+
+    def p_mean_variance(self, x, t, classes, clip_denoised = True):
+        preds = self.model_predictions(x, t, classes)
+        x_start = preds.pred_x_start
+
+        if clip_denoised:
+            x_start.clamp_(-1., 1.)
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
+        return model_mean, posterior_variance, posterior_log_variance, x_start
+
+    @torch.no_grad()
+    def p_sample(self, x, t: int, classes, clip_denoised = True):
+        b, *_, device = *x.shape, x.device
+        batched_times = torch.full((x.shape[0],), t, device = x.device, dtype = torch.long)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, classes = classes, clip_denoised = clip_denoised)
+        noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
+        pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
+        return pred_img, x_start
+
+    @torch.no_grad()
+    def p_sample_loop(self, classes, shape):
+        batch, device = shape[0], self.betas.device
+
+        img = torch.randn(shape, device=device)
+
+        x_start = None
+
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps, disable=self.tqdm_disable):
+            img, x_start = self.p_sample(img, t, classes)
+
+        return img
+
+    @torch.inference_mode()
+    def ddim_sample(self, classes, shape, clip_denoised = True):
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+
+        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+        img = torch.randn(shape, device = device)
+
+        x_start = None
+
+        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step', disable=self.tqdm_disable):
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, clip_x_start = clip_denoised)
+
+            if time_next < 0:
+                img = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(img)
+
+            img = x_start * alpha_next.sqrt() + \
+                  c * pred_noise + \
+                  sigma * noise
+
+        return img
+
+    @torch.inference_mode()
+    def sample_with_class(self, classes, ):
+        batch_size, image_size, channels = classes.shape[0], self.image_size, self.channels
+        sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
+        return sample_fn(classes, (batch_size, channels, image_size[0], image_size[1]))
+
+    # # sample with random classes
+    # @torch.inference_mode()
+    # def sample(self, batch_size = 16, cond_scale = 6., rescaled_phi = 0.7):
+    #     classes = torch.randint(0, self.model.num_classes, (batch_size,), device = self.device)
+    #     return self.sample_with_class(classes, cond_scale, rescaled_phi)
+
+    @torch.inference_mode()
+    def interpolate(self, x1, x2, classes, t = None, lam = 0.5):
+        b, *_, device = *x1.shape, x1.device
+        t = default(t, self.num_timesteps - 1)
+
+        assert x1.shape == x2.shape
+
+        t_batched = torch.stack([torch.tensor(t, device = device)] * b)
+        xt1, xt2 = map(lambda x: self.q_sample(x, t = t_batched), (x1, x2))
+
+        img = (1 - lam) * xt1 + lam * xt2
+
+        for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t, disable=self.tqdm_disable):
+            img, _ = self.p_sample(img, i, classes)
+
+        return img
+
+    @autocast('cuda', enabled = False)
+    def q_sample(self, x_start, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        if self.offset_noise_strength > 0.:
+            offset_noise = torch.randn(x_start.shape[:2], device = self.device)
+            noise += self.offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
+
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def p_losses(self, x_start, t, *, classes, noise = None):
+        b, c, h, w = x_start.shape
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # noise sample
+
+        x = self.q_sample(x_start = x_start, t = t, noise = noise)
+
+        # predict and take gradient step
+
+        model_out = self.model(x, t, classes)
+        if self.objective == 'pred_noise':
+            target = noise
+        elif self.objective == 'pred_x0':
+            target = x_start
+        elif self.objective == 'pred_v':
+            v = self.predict_v(x_start, t, noise)
+            target = v
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+
+        loss = F.mse_loss(model_out, target, reduction = 'none')
+        loss = reduce(loss, 'b ... -> b', 'mean')
+
+        loss = loss * extract(self.loss_weight, t, loss.shape)
+        return loss.mean()
+
+    def forward(self, img, *args, **kwargs):
+        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+        assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+
+        return self.p_losses(img, t, *args, **kwargs)
+
+class Trainer:
+    def __init__(
+        self,
+        diffusion_model,
+        dataset,
+        *,
+        validation_dataset = None,
+        train_batch_size = 16,
+        validation_batch_size = 16,
+        gradient_accumulate_every = 1,
+        train_lr = 1e-4,
+        train_num_steps = 100000,
+        ema_update_every = 10,
+        ema_decay = 0.995,
+        adam_betas = (0.9, 0.99),
+        save_and_sample_every = 1000,
+        results_folder = "./results",
+        amp = False,
+        mixed_precision_type = 'fp16',
+        split_batches = True,
+        convert_image_to = None,
+        # calculate_fid = True,
+        # fid_batch_size = None,
+        # inception_block_idx = 2048,
+        max_grad_norm = 1.,
+        # num_fid_samples = 50000,
+        save_best_and_latest_only = False,
+        tensorboard_log = None,
+        tensorboard_log_steps = 100,
+    ):
+        super().__init__()
+
+        # accelerator
+
+        ipg_handler = InitProcessGroupKwargs(
+                    timeout=timedelta(hours=12),
+                    )
+
+
+        self.accelerator = Accelerator(
+            kwargs_handlers=[ipg_handler],
+            split_batches = split_batches,
+            mixed_precision = mixed_precision_type if amp else 'no'
+        )
+
+        # prepare tensorboard
+        self.tensor_board_log_steps = tensorboard_log_steps
+        if tensorboard_log is not None and self.accelerator.is_main_process:
+            self.tensor_writer = SummaryWriter(log_dir=tensorboard_log)
+        else:
+            self.tensor_writer = None
+
+
+        # model
+
+        self.model = diffusion_model
+        self.channels = self.model.channels
+        is_ddim_sampling = self.model.is_ddim_sampling
+
+        # default convert_image_to depending on channels
+
+        if not exists(convert_image_to):
+            convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
+
+        # sampling and training hyperparameters
+
+        self.save_and_sample_every = save_and_sample_every
+
+        self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
+
+        self.train_num_steps = train_num_steps
+        self.image_size = self.model.image_size
+
+        self.max_grad_norm = max_grad_norm
+        # preparing Training dataset and dataloader
+        self.ds = dataset
+
+        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+
+        dl = DataLoader(self.ds, 
+                        batch_size = train_batch_size,
+                        shuffle = True, 
+                        pin_memory = True, 
+                        num_workers = 8, 
+                        persistent_workers=True,)
+
+        dl = self.accelerator.prepare(dl)
+        self.dl = cycle(dl)
+
+        # if self.accelerator.is_main_process:
+        #     self.val_ds = validation_dataset
+
+        #     if self.val_ds is not None:
+        #         self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
+        #     else:
+        #         self.val_dl = None
+        # else:
+        #     self.val_dl = None
+
+        # prepare validation dataset and dataloader
+        self.val_ds = validation_dataset
+        if self.val_ds is not None:
+            self.val_dl = DataLoader(self.val_ds, 
+                                     batch_size = validation_batch_size, 
+                                     shuffle = False, 
+                                     pin_memory = True, 
+                                     num_workers = 8, 
+                                     persistent_workers=True)
+            self.val_dl_len = len(self.val_ds)
+            self.val_dl = self.accelerator.prepare(self.val_dl)
+
+            self.dummy_ema_model = copy.deepcopy(self.model)
+            self.dummy_ema_model.eval()
+            self.dummy_ema_model.requires_grad_(False)
+            self.dummy_ema_model.to(self.device)
+            self.dummy_ema_model.tqdm_disable = not self.accelerator.is_main_process
+        else:
+            self.val_dl = None
+
+        # optimizer
+
+        self.opt = Adam(self.model.parameters(), lr = train_lr, betas = adam_betas)
+
+        # for logging results in a folder periodically
+
+        if self.accelerator.is_main_process:
+            self.ema = EMA(self.model, beta = ema_decay, update_every = ema_update_every)
+            self.ema.to(self.device)
+
+        if results_folder is None:
+            self.result_temp_folder = tempfile.TemporaryDirectory()
+            self.results_folder = Path(self.result_temp_folder.name)
+        else:
+            self.results_folder = Path(results_folder)
+            self.results_folder.mkdir(exist_ok = True)
+
+        # step counter state
+
+        self.step = 0
+
+        # prepare model, dataloader, optimizer with accelerator
+
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+
+        self.validation_batch_size = validation_batch_size
+
+        if save_best_and_latest_only:
+            self.best_SNR = 1e10 # infinite
+
+        self.save_best_and_latest_only = save_best_and_latest_only
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    def save(self, milestone):
+        if not self.accelerator.is_local_main_process:
+            return
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            'version': __version__
+        }
+
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
+    def load(self, milestone):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device, weights_only=True)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        if self.accelerator.is_main_process:
+            self.ema.load_state_dict(data["ema"])
+
+        if 'version' in data:
+            print(f"loading from version {data['version']}")
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
+
+    def train(self):
+        accelerator = self.accelerator
+        device = accelerator.device
+        total_loss = 0.
+        cum_loss = 0.
+
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+            while self.step < self.train_num_steps:
+                self.model.train()
+                for _ in range(self.gradient_accumulate_every):
+                    data, cond = next(self.dl)
+                    data = data.to(device, non_blocking = True)
+                    cond = cond.to(device, non_blocking = True)
+
+                    with self.accelerator.autocast():
+                        loss = self.model(data, classes=cond)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+
+                    self.accelerator.backward(loss)
+
+                cum_loss  = cum_loss*0.9 + loss.item()*0.1
+                pbar.set_description(f'loss: {cum_loss:.4f}')
+
+                self.step += 1
+
+                if (self.tensor_writer is not None) and (self.step % self.tensor_board_log_steps == 0):
+                    self.tensor_writer.add_scalar('train loss', total_loss/self.tensor_board_log_steps, self.step)
+                    total_loss = 0.
+
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.opt.step()
+                self.opt.zero_grad()
+
+                pbar.update(1)
+                if accelerator.is_main_process:
+                    self.ema.update()
+
+                # Save and validate
+                if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
+                    with torch.inference_mode():
+                        # Validation
+                        if self.val_dl is not None:
+                            SNR_sum = torch.tensor(0.).to(device)
+
+                            # Broadcast ema model state dict
+                            if self.accelerator.is_main_process:
+                                dummy_ema_state = self.ema.ema_model.state_dict()
+                            else:
+                                dummy_ema_state = self.dummy_ema_model.state_dict()
+
+                            accelerate.utils.broadcast(dummy_ema_state)
+                            self.dummy_ema_model.load_state_dict(dummy_ema_state)
+
+                            # Validation loop
+                            for data, cond in tqdm(self.val_dl, total= len(self.val_dl), desc = 'validation loop', disable = not accelerator.is_main_process):
+                                data = data.to(device, non_blocking = True)
+                                cond = cond.to(device, non_blocking = True)
+
+                                predict = self.dummy_ema_model.sample_with_class(
+                                    classes = cond,
+                                )
+
+                                SNR = cal_SNR(predict, data)
+                                SNR_sum += torch.sum(SNR)
+                            
+                            gathered_SNR = accelerator.gather_for_metrics(SNR_sum)
+                            if accelerator.is_main_process:
+                                SNR = torch.sum(gathered_SNR).item() / self.val_dl_len
+                                accelerator.print(f'SNR: {SNR:.2f}')
+                                if self.tensor_writer is not None:
+                                    self.tensor_writer.add_scalar('SNR', SNR, self.step)
+                        
+                        # save model
+                        milestone = self.step // self.save_and_sample_every
+                        if self.accelerator.is_main_process:
+                            if self.save_best_and_latest_only:
+                                if self.best_SNR > SNR:
+                                    self.best_SNR = SNR
+                                    self.save("best")
+                                self.save("latest")
+                            else:
+                                self.save(milestone)
+
+                        if self.tensor_writer is not None:
+                            self.tensor_writer.flush()
+
+                        accelerator.wait_for_everyone()
+
+        accelerator.print('training complete')
+
+    def __del__(self):
+        if self.tensor_writer is not None:
+            self.tensor_writer.close()
+        self.accelerator.end_training()
+
+
+# example
+
+# if __name__ == '__main__':
+#     num_classes = 10
+
+#     model = Unet(
+#         dim = 64,
+#         dim_mults = (1, 2, 4, 8),
+#         num_classes = num_classes,
+#         cond_drop_prob = 0.5
+#     )
+
+#     diffusion = GaussianDiffusion(
+#         model,
+#         image_size = 128,
+#         timesteps = 1000
+#     ).cuda()
+
+#     training_images = torch.randn(8, 3, 128, 128).cuda() # images are normalized from 0 to 1
+#     image_classes = torch.randint(0, num_classes, (8,)).cuda()    # say 10 classes
+
+#     loss = diffusion(training_images, classes = image_classes)
+#     loss.backward()
+
+#     # do above for many steps
+
+#     sampled_images = diffusion.sample(
+#         classes = image_classes,
+#         cond_scale = 6.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
+#     )
+
+#     sampled_images.shape # (8, 3, 128, 128)
+
+#     # interpolation
+
+#     interpolate_out = diffusion.interpolate(
+#         training_images[:1],
+#         training_images[:1],
+#         image_classes[:1]
+#     )
+
