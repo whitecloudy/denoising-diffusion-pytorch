@@ -17,10 +17,12 @@ from denoising_diffusion_pytorch.classifier_free_guidance import Downsample, Blo
 
 def __main__():
     training_datafiles = ['../ssddata/RENEW/ArgosCSI-96x8-2016-05-01-06-57-58-2.4GHz-continuousmobile', '../ssddata/RENEW/ArgosCSI-96x8-2016-11-04-05-37-37_2.4GHz_track_left_to_right_NLOS']
-    validation_datafiles = ["../ssddata/RENEW/ArgosCSI-96x8-2016-05-01-06-38-03-2.4GHz-static"]
+    # validation_datafiles = ["../ssddata/RENEW/ArgosCSI-96x8-2016-05-01-06-38-03-2.4GHz-static"]
+    validation_datafiles = ["../ssddata/RENEW/ArgosCSI-96x2-2016-12-07-03-00-36_rotation_mob_horizontal_omni"]
 
-    dataset = Five_G_dataset.Five_G_dataset(data_path=training_datafiles, return_complex=False)
-    val_dataset = Five_G_dataset.Five_G_dataset(data_path=validation_datafiles, return_complex=False)
+
+    dataset = Five_G_dataset.Five_G_dataset(data_path=training_datafiles, return_complex=False, real_dim=-3, transpose=(1, 0, 2))
+    val_dataset = Five_G_dataset.Five_G_dataset(data_path=validation_datafiles, return_complex=False, real_dim=-3, transpose=(1, 0, 2))
 
     model = Unet(
         dim = 128,
@@ -32,7 +34,7 @@ def __main__():
 
     diffusion = GaussianDiffusion(
         model,
-        objective = 'pred_noise',
+        objective = 'pred_x0',
         image_size = (14, 26),
         beta_schedule='linear',
         timesteps = 1000,    # number of steps
@@ -61,8 +63,10 @@ def __main__():
     import datetime
     now = datetime.datetime.now()
     current_time = now.strftime("%Y-%m-%d_%H-%M-%S")
-    results_folder: str = "./results/"+current_time
-    tensorboard_log_name = './log/snr_test/'+current_time
+    # current_time = "2025-05-17_00-18-36"
+    tag = "_Predict_x0"
+    results_folder: str = "./results/"+current_time+tag
+    tensorboard_log_name = './log/snr_test/'+current_time+tag
     
     trainer = Trainer(diffusion, 
                     dataset,

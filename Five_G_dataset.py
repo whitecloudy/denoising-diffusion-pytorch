@@ -15,7 +15,7 @@ class Five_G_dataset(Dataset):
     Returns:
         complex data (torch.tensor): Uplink data(Node, Time slot, Subcarrier), Downlink data(Node, Time slot, Subcarrier)
     """
-    def __init__(self, data_path, self_normalize=True, return_complex=True, transform=None):
+    def __init__(self, data_path, self_normalize=True, return_complex=True, real_dim=None, transpose=None):
         super().__init__()
         self.data_filenames = []
 
@@ -30,9 +30,11 @@ class Five_G_dataset(Dataset):
 
         self.data_filenames = pd.DataFrame(self.data_filenames, columns=['filename'])
 
-        self.transform = transform
+        self.transpose = transpose
+
         self.self_normalize = self_normalize
         self.return_complex = return_complex
+        self.real_dim = real_dim
 
         # if dtype is None:
         #     if return_complex:
@@ -41,29 +43,31 @@ class Five_G_dataset(Dataset):
         #         self.dtype = torch.float32
 
     @staticmethod
-    def complex_to_real(data : torch.tensor):
+    def complex_to_real(data : torch.tensor, dim : int):
         """
         Convert complex data to real data.
         Args:
-            data (torch.tensor): Complex data (Node, Time slot, Subcarrier)
+            data (torch.tensor): Complex data (Time slot, Node, Subcarrier)
         Returns:
-            real_data (torch.tensor): Real data (2*Node, Time slot, Subcarrier)
+            real_data (torch.tensor): Real data (Time slot, Node*2, Subcarrier)
         """
-        real_data = torch.cat((data.real, data.imag), dim=-3)
+        assert type(dim) == int, "The dimension should be an integer"
+        real_data = torch.cat((data.real, data.imag), dim=dim)
         return real_data
     
     @staticmethod
-    def real_to_complex(data : torch.tensor):
+    def real_to_complex(data : torch.tensor, dim : int):
         """
         Convert real data to complex data.
         Args:
-            data (torch.tensor): Real data (2*Node, Time slot, Subcarrier)
+            data (torch.tensor): Real data (Time slot, Node*2, Subcarrier)
         Returns:
-            complex_data (torch.tensor): Complex data (Node, Time slot, Subcarrier)
+            complex_data (torch.tensor): Complex data (Time slot, Node, Subcarrier)
         """
-        assert data.shape[-3] % 2 == 0, "The first dimension of the data should be even"
+        assert data.shape[dim] % 2 == 0, "The first dimension of the data should be even"
+        assert type(dim) == int, "The dimension should be an integer"
         # Split the data into real and imaginary parts
-        real_imag_data = torch.split(data, data.shape[-3] // 2, dim=-3)
+        real_imag_data = torch.split(data, data.shape[dim] // 2, dim=dim)
         # Concatenate the real and imaginary parts to form complex data
         complex_data = real_imag_data[0] + 1j * real_imag_data[1]
         return complex_data
@@ -73,8 +77,8 @@ class Five_G_dataset(Dataset):
         """
         Normalize the data and condition.
         Args:
-            data (torch.tensor): Data (Node, Time slot, Subcarrier)
-            cond (torch.tensor): Condition (Node, Time slot, Subcarrier)
+            data (torch.tensor): Data (Time slot, Node, Subcarrier)
+            cond (torch.tensor): Condition (Time slot, Node, Subcarrier)
         Returns:
             normalized_data (torch.tensor): Normalized data
             normalized_cond (torch.tensor): Normalized condition
@@ -93,19 +97,21 @@ class Five_G_dataset(Dataset):
         # (Time slot, Node, Subcarrier)
 
         with np.load(filename) as loaded_data:
-            # (Node, Time slot, Subcarrier)
-            data = np.transpose(loaded_data['data'].astype(np.complex64), (1, 0, 2))
-            cond = np.transpose(loaded_data['cond'].astype(np.complex64), (1, 0, 2))
-
-        data = torch.from_numpy(data)
-        cond = torch.from_numpy(cond)
+            # (Time slot, Node, Subcarrier)
+            data = loaded_data['data'].astype(np.complex64)
+            cond = loaded_data['cond'].astype(np.complex64)
+            if self.transpose is not None:
+                data = np.transpose(data, self.transpose)
+                cond = np.transpose(cond, self.transpose)
+            data = torch.from_numpy(data)
+            cond = torch.from_numpy(cond)
 
         if self.self_normalize:
             data, cond = self.normalize(data, cond)
 
         if not self.return_complex:
-            data = self.complex_to_real(data)
-            cond = self.complex_to_real(cond)
+            data = self.complex_to_real(data, self.real_dim)
+            cond = self.complex_to_real(cond, self.real_dim)
 
         return data, cond
     
