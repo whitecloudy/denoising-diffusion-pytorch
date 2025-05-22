@@ -1044,7 +1044,7 @@ class Trainer:
         accelerator = self.accelerator
         device = accelerator.device
         total_loss = 0.
-        cum_loss = 0.
+        cum_loss = None
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
             while self.step < self.train_num_steps:
@@ -1061,13 +1061,16 @@ class Trainer:
 
                     self.accelerator.backward(loss)
 
-                cum_loss  = cum_loss*0.9 + loss.item()*0.1
+                if cum_loss is None:
+                    cum_loss = loss.item()
+                else:
+                    cum_loss  = cum_loss*0.9 + loss.item()*0.1
                 pbar.set_description(f'loss: {cum_loss:.4f}')
 
                 self.step += 1
 
                 if (self.tensor_writer is not None) and (self.step % self.tensor_board_log_steps == 0):
-                    self.tensor_writer.add_scalar('train loss', total_loss/self.tensor_board_log_steps, self.step)
+                    self.tensor_writer.add_scalar('Train/loss', total_loss/self.tensor_board_log_steps, self.step)
                     total_loss = 0.
 
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1085,6 +1088,7 @@ class Trainer:
                         # Validation
                         if self.val_dl is not None:
                             SNR_sum = torch.tensor(0.).to(device)
+                            loss_sum = torch.tensor(0.).to(device)
 
                             # Broadcast ema model state dict
                             if self.accelerator.is_main_process:
@@ -1104,15 +1108,22 @@ class Trainer:
                                     classes = cond,
                                 )
 
+                                loss = F.mse_loss(predict, data, reduction = 'none')
+                                loss = reduce(loss, 'b ... -> b', 'mean')
+                                loss_sum += torch.sum(loss)
+
                                 SNR = cal_SNR(predict, data)
                                 SNR_sum += torch.sum(SNR)
                             
                             gathered_SNR = accelerator.gather_for_metrics(SNR_sum)
+                            gathered_loss = accelerator.gather_for_metrics(loss_sum)
                             if accelerator.is_main_process:
                                 SNR = torch.sum(gathered_SNR).item() / self.val_dl_len
-                                accelerator.print(f'SNR: {SNR:.2f}')
+                                loss = torch.sum(gathered_loss).item() / self.val_dl_len
+                                accelerator.print(f'SNR: {SNR:.2f}, Loss: {loss:.4f}')
                                 if self.tensor_writer is not None:
-                                    self.tensor_writer.add_scalar('SNR', SNR, self.step)
+                                    self.tensor_writer.add_scalar('Validation/SNR', SNR, self.step)
+                                    self.tensor_writer.add_scalar('Validation/Loss', loss, self.step)
                         
                         # save model
                         milestone = self.step // self.save_and_sample_every
