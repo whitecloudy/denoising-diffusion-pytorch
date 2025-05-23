@@ -52,6 +52,7 @@ class Five_G_dataset(Dataset):
             real_data (torch.tensor): Real data (Time slot, Node*2, Subcarrier)
         """
         assert type(dim) == int, "The dimension should be an integer"
+        data = torch.view_as_complex(data)
         real_data = torch.cat((data.real, data.imag), dim=dim)
         return real_data
     
@@ -69,7 +70,7 @@ class Five_G_dataset(Dataset):
         # Split the data into real and imaginary parts
         real_imag_data = torch.split(data, data.shape[dim] // 2, dim=dim)
         # Concatenate the real and imaginary parts to form complex data
-        complex_data = real_imag_data[0] + 1j * real_imag_data[1]
+        complex_data = torch.view_as_real(real_imag_data[0] + 1j * real_imag_data[1])
         return complex_data
     
     @staticmethod
@@ -108,6 +109,9 @@ class Five_G_dataset(Dataset):
 
         if self.self_normalize:
             data, cond = self.normalize(data, cond)
+
+        data = torch.view_as_real(data)
+        cond = torch.view_as_real(cond)
 
         if not self.return_complex:
             data = self.complex_to_real(data, self.real_dim)

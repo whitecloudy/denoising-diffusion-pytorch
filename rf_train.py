@@ -4,7 +4,8 @@ from torchvision.datasets import CIFAR10
 import torchvision.transforms as transforms
 import tensorboard
 
-from denoising_diffusion_pytorch.rf_diffusion import tfdiff_mimo, GaussianDiffusion, Trainer
+from denoising_diffusion_pytorch.rf_diffusion import tfdiff_mimo, GaussianDiffusion
+from denoising_diffusion_pytorch.classifier_free_guidance import Trainer
 from denoising_diffusion_pytorch.params import all_params
 
 from absl import app, flags
@@ -17,43 +18,35 @@ def __main__():
     validation_datafiles = ["../ssddata/RENEW/ArgosCSI-96x2-2016-12-07-03-00-36_rotation_mob_horizontal_omni"]
 
 
-    dataset = Five_G_dataset.Five_G_dataset(data_path=training_datafiles, return_complex=False)
-    val_dataset = Five_G_dataset.Five_G_dataset(data_path=validation_datafiles, return_complex=False)
+    dataset = Five_G_dataset.Five_G_dataset(data_path=training_datafiles, return_complex=False, real_dim=-3, transpose=(1, 0, 2))
+    val_dataset = Five_G_dataset.Five_G_dataset(data_path=validation_datafiles, return_complex=False, real_dim=-3, transpose=(1, 0, 2))
 
     params = all_params[2]
-
-    # model = Unet(
-    #     dim = 128,
-    #     channels=192,
-    #     condition_channel = (192, 14, 26),
-    #     dim_mults = (1, 2, 2, 2),
-    #     dropout=0.1,
-    # )
-
-    params.max_step = 1000
 
     model = tfdiff_mimo(params=params)
 
     diffusion = GaussianDiffusion(
         model,
-        objective = 'pred_noise',
-        image_size = (14, 26),
+        objective = 'pred_x0',
+        data_shape = dataset[0][0].shape,
         beta_schedule='linear',
-        timesteps = 1000,    # number of steps
+        timesteps = params.max_step,    # number of steps
     )
 
     import datetime
     now = datetime.datetime.now()
-    # current_time = now.strftime("%Y-%m-%d_%H-%M-%S")
-    current_time = "2025-05-17_00-18-36"
+    current_time = now.strftime("%Y-%m-%d_%H-%M-%S")
+
+    current_time = "Test"
+    
     results_folder: str = "./results/"+current_time
     tensorboard_log_name = './log/snr_test/'+current_time
     
     trainer = Trainer(diffusion, 
                     dataset,
                     validation_dataset=val_dataset,
-                    train_batch_size = 128,
-                    validation_batch_size= 512,
+                    train_batch_size = 32,
+                    validation_batch_size= 64,
                     train_lr = 2e-4,
                     train_num_steps = 800000,         # total training steps
                     results_folder=results_folder, # folder to save results
@@ -65,8 +58,8 @@ def __main__():
                     tensorboard_log=tensorboard_log_name,             # log training to tensorboard
                     tensorboard_log_steps=64,         # log training to tensorboard every 100 steps
                     )
+    
     torch.manual_seed(0)
-    trainer.load("latest")
     trainer.train()
     # # after a lot of training
 

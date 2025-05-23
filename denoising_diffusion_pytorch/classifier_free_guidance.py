@@ -909,13 +909,7 @@ class Trainer:
         # model
 
         self.model = diffusion_model
-        self.channels = self.model.channels
         is_ddim_sampling = self.model.is_ddim_sampling
-
-        # default convert_image_to depending on channels
-
-        if not exists(convert_image_to):
-            convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
 
         # sampling and training hyperparameters
 
@@ -926,7 +920,6 @@ class Trainer:
         assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
 
         self.train_num_steps = train_num_steps
-        self.image_size = self.model.image_size
 
         self.max_grad_norm = max_grad_norm
         # preparing Training dataset and dataloader

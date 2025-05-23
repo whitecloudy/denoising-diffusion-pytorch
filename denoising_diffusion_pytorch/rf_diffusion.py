@@ -32,6 +32,7 @@ from tqdm.auto import tqdm
 
 import complex.complex_module as cm
 import numpy as np
+from Five_G_dataset import Five_G_dataset
 
 
 # constants
@@ -42,7 +43,7 @@ ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 @torch.inference_mode()
 def cal_SNR(predict, truth):
     # Recombine the real and imaginary parts to form complex values
-    real_imag_dim_line = predict.shape[1]//2
+    real_imag_dim_line = predict.shape[-3]//2
     predict_complex = (predict[:,:real_imag_dim_line,:,:] + 1j * predict[:,real_imag_dim_line:,:,:])
     truth_complex = (truth[:,:real_imag_dim_line,:,:] + 1j * truth[:,real_imag_dim_line:,:,:])
     PS = torch.sum(torch.abs(truth_complex)**2, dim=(-1, -2, -3))  # power of signal
@@ -420,7 +421,7 @@ class GaussianDiffusion(nn.Module):
         self,
         model,
         *,
-        image_size,
+        data_shape,
         timesteps = 1000,
         sampling_timesteps = None,
         objective = 'pred_noise',
@@ -429,17 +430,12 @@ class GaussianDiffusion(nn.Module):
         offset_noise_strength = 0.,
         min_snr_loss_weight = False,
         min_snr_gamma = 5,
-        use_cfg_plus_plus = False, # https://arxiv.org/pdf/2406.08070
         tqdm_disable = False,
     ):
         super().__init__()
-        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
-        assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
-        self.channels = self.model.channels
-
-        self.image_size = image_size
+        self.data_shape = data_shape
 
         self.objective = objective
 
@@ -459,10 +455,6 @@ class GaussianDiffusion(nn.Module):
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
         self.tqdm_disable = tqdm_disable
-
-        # use cfg++ when ddim sampling
-
-        self.use_cfg_plus_plus = use_cfg_plus_plus
 
         # sampling related parameters
 
@@ -559,13 +551,30 @@ class GaussianDiffusion(nn.Module):
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
+    
+
+    def model_forward(self, x, t, classes):
+        x = torch.transpose(x, -3, -2)
+        classes = torch.transpose(classes, -3, -2)
+        x = Five_G_dataset.real_to_complex(x, dim = -2)
+        classes = Five_G_dataset.real_to_complex(classes, dim = -2)
+        x = torch.transpose(x, -3, -2)
+        classes = torch.transpose(classes, -3, -2)
+
+        model_out = self.model.forward(x, t, classes)
+
+        model_out = torch.transpose(model_out, -3, -2)
+        model_out = Five_G_dataset.complex_to_real(model_out, dim = -2)
+        model_out = torch.transpose(model_out, -3, -2)
+        return model_out
+
 
     def model_predictions(self, x, t, classes, clip_x_start = False):
-        model_output, model_output_null = self.model.forward(x, t, classes)
+        model_output = self.model_forward(x, t, classes)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
-            pred_noise = model_output if not self.use_cfg_plus_plus else model_output_null
+            pred_noise = model_output
 
             x_start = self.predict_start_from_noise(x, t, model_output)
             x_start = maybe_clip(x_start)
@@ -573,8 +582,7 @@ class GaussianDiffusion(nn.Module):
         elif self.objective == 'pred_x0':
             x_start = model_output
             x_start = maybe_clip(x_start)
-            x_start_for_pred_noise = x_start if not self.use_cfg_plus_plus else maybe_clip(model_output_null)
-
+            x_start_for_pred_noise = x_start
             pred_noise = self.predict_noise_from_start(x, t, x_start_for_pred_noise)
 
         elif self.objective == 'pred_v':
@@ -583,9 +591,6 @@ class GaussianDiffusion(nn.Module):
             x_start = maybe_clip(x_start)
 
             x_start_for_pred_noise = x_start
-            if self.use_cfg_plus_plus:
-                x_start_for_pred_noise = self.predict_start_from_v(x, t, model_output_null)
-                x_start_for_pred_noise = maybe_clip(x_start_for_pred_noise)
 
             pred_noise = self.predict_noise_from_start(x, t, x_start_for_pred_noise)
 
@@ -658,10 +663,10 @@ class GaussianDiffusion(nn.Module):
         return img
 
     @torch.inference_mode()
-    def sample_with_class(self, classes, ):
-        batch_size, image_size, channels = classes.shape[0], self.image_size, self.channels
+    def sample_with_class(self, classes):
+        batch_size, data_shape = classes.shape[0], self.data_shape
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn(classes, (batch_size, channels, image_size[0], image_size[1]))
+        return sample_fn(classes, (batch_size, data_shape[0], data_shape[1], data_shape[2]))
 
     # # sample with random classes
     # @torch.inference_mode()
@@ -708,8 +713,7 @@ class GaussianDiffusion(nn.Module):
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # predict and take gradient step
-
-        model_out = self.model(x, t, classes)
+        model_out = self.model_forward(x, t, classes)
         if self.objective == 'pred_noise':
             target = noise
         elif self.objective == 'pred_x0':
@@ -719,7 +723,6 @@ class GaussianDiffusion(nn.Module):
             target = v
         else:
             raise ValueError(f'unknown objective {self.objective}')
-
         loss = F.mse_loss(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b', 'mean')
 
@@ -727,340 +730,8 @@ class GaussianDiffusion(nn.Module):
         return loss.mean()
 
     def forward(self, img, *args, **kwargs):
-        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
-        assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
+        b, d_0, d_1, d_2, device, data_shape = *img.shape, img.device, self.data_shape
+        assert d_0 == data_shape[0] and d_1 == data_shape[1] and d_2 == data_shape[2], f'height and width of image must be {data_shape}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         return self.p_losses(img, t, *args, **kwargs)
-
-class Trainer:
-    def __init__(
-        self,
-        diffusion_model,
-        dataset,
-        *,
-        validation_dataset = None,
-        train_batch_size = 16,
-        validation_batch_size = 16,
-        gradient_accumulate_every = 1,
-        train_lr = 1e-4,
-        train_num_steps = 100000,
-        ema_update_every = 10,
-        ema_decay = 0.995,
-        adam_betas = (0.9, 0.99),
-        save_and_sample_every = 1000,
-        results_folder = "./results",
-        amp = False,
-        mixed_precision_type = 'fp16',
-        split_batches = True,
-        convert_image_to = None,
-        # calculate_fid = True,
-        # fid_batch_size = None,
-        # inception_block_idx = 2048,
-        max_grad_norm = 1.,
-        # num_fid_samples = 50000,
-        save_best_and_latest_only = False,
-        tensorboard_log = None,
-        tensorboard_log_steps = 100,
-    ):
-        super().__init__()
-
-        # accelerator
-
-        ipg_handler = InitProcessGroupKwargs(
-                    timeout=timedelta(hours=12),
-                    )
-
-
-        self.accelerator = Accelerator(
-            kwargs_handlers=[ipg_handler],
-            split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
-        )
-
-        # prepare tensorboard
-        self.tensor_board_log_steps = tensorboard_log_steps
-        if tensorboard_log is not None and self.accelerator.is_main_process:
-            self.tensor_writer = SummaryWriter(log_dir=tensorboard_log)
-        else:
-            self.tensor_writer = None
-
-
-        # model
-
-        self.model = diffusion_model
-        self.channels = self.model.channels
-        is_ddim_sampling = self.model.is_ddim_sampling
-
-        # default convert_image_to depending on channels
-
-        if not exists(convert_image_to):
-            convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
-
-        # sampling and training hyperparameters
-
-        self.save_and_sample_every = save_and_sample_every
-
-        self.batch_size = train_batch_size
-        self.gradient_accumulate_every = gradient_accumulate_every
-        assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
-
-        self.train_num_steps = train_num_steps
-        self.image_size = self.model.image_size
-
-        self.max_grad_norm = max_grad_norm
-        # preparing Training dataset and dataloader
-        self.ds = dataset
-
-        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
-
-        dl = DataLoader(self.ds, 
-                        batch_size = train_batch_size,
-                        shuffle = True, 
-                        pin_memory = True, 
-                        num_workers = 8, 
-                        persistent_workers=True,)
-
-        dl = self.accelerator.prepare(dl)
-        self.dl = cycle(dl)
-
-        # if self.accelerator.is_main_process:
-        #     self.val_ds = validation_dataset
-
-        #     if self.val_ds is not None:
-        #         self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
-        #     else:
-        #         self.val_dl = None
-        # else:
-        #     self.val_dl = None
-
-        # prepare validation dataset and dataloader
-        self.val_ds = validation_dataset
-        if self.val_ds is not None:
-            self.val_dl = DataLoader(self.val_ds, 
-                                     batch_size = validation_batch_size, 
-                                     shuffle = False, 
-                                     pin_memory = True, 
-                                     num_workers = 8, 
-                                     persistent_workers=True)
-            self.val_dl_len = len(self.val_ds)
-            self.val_dl = self.accelerator.prepare(self.val_dl)
-
-            self.dummy_ema_model = copy.deepcopy(self.model)
-            self.dummy_ema_model.eval()
-            self.dummy_ema_model.requires_grad_(False)
-            self.dummy_ema_model.to(self.device)
-            self.dummy_ema_model.tqdm_disable = not self.accelerator.is_main_process
-        else:
-            self.val_dl = None
-
-        # optimizer
-
-        self.opt = Adam(self.model.parameters(), lr = train_lr, betas = adam_betas)
-
-        # for logging results in a folder periodically
-
-        if self.accelerator.is_main_process:
-            self.ema = EMA(self.model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
-
-        if results_folder is None:
-            self.result_temp_folder = tempfile.TemporaryDirectory()
-            self.results_folder = Path(self.result_temp_folder.name)
-        else:
-            self.results_folder = Path(results_folder)
-            self.results_folder.mkdir(exist_ok = True)
-
-        # step counter state
-
-        self.step = 0
-
-        # prepare model, dataloader, optimizer with accelerator
-
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
-
-        self.validation_batch_size = validation_batch_size
-
-        if save_best_and_latest_only:
-            self.best_SNR = 1e10 # infinite
-
-        self.save_best_and_latest_only = save_best_and_latest_only
-
-    @property
-    def device(self):
-        return self.accelerator.device
-
-    def save(self, milestone):
-        if not self.accelerator.is_local_main_process:
-            return
-
-        data = {
-            'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model),
-            'opt': self.opt.state_dict(),
-            'ema': self.ema.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
-            'version': __version__
-        }
-
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
-
-    def load(self, milestone):
-        accelerator = self.accelerator
-        device = accelerator.device
-
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device, weights_only=True)
-
-        model = self.accelerator.unwrap_model(self.model)
-        model.load_state_dict(data['model'])
-
-        self.step = data['step']
-        self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
-            self.ema.load_state_dict(data["ema"])
-
-        if 'version' in data:
-            print(f"loading from version {data['version']}")
-
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
-            self.accelerator.scaler.load_state_dict(data['scaler'])
-
-    def train(self):
-        accelerator = self.accelerator
-        device = accelerator.device
-        total_loss = 0.
-        cum_loss = 0.
-
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-            while self.step < self.train_num_steps:
-                self.model.train()
-                for _ in range(self.gradient_accumulate_every):
-                    data, cond = next(self.dl)
-                    data = data.to(device, non_blocking = True)
-                    cond = cond.to(device, non_blocking = True)
-
-                    with self.accelerator.autocast():
-                        loss = self.model(data, classes=cond)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
-
-                    self.accelerator.backward(loss)
-
-                cum_loss  = cum_loss*0.9 + loss.item()*0.1
-                pbar.set_description(f'loss: {cum_loss:.4f}')
-
-                self.step += 1
-
-                if (self.tensor_writer is not None) and (self.step % self.tensor_board_log_steps == 0):
-                    self.tensor_writer.add_scalar('train loss', total_loss/self.tensor_board_log_steps, self.step)
-                    total_loss = 0.
-
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
-                self.opt.step()
-                self.opt.zero_grad()
-
-                pbar.update(1)
-                if accelerator.is_main_process:
-                    self.ema.update()
-
-                # Save and validate
-                if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
-                    with torch.inference_mode():
-                        # Validation
-                        if self.val_dl is not None:
-                            SNR_sum = torch.tensor(0.).to(device)
-
-                            # Broadcast ema model state dict
-                            if self.accelerator.is_main_process:
-                                dummy_ema_state = self.ema.ema_model.state_dict()
-                            else:
-                                dummy_ema_state = self.dummy_ema_model.state_dict()
-
-                            accelerate.utils.broadcast(dummy_ema_state)
-                            self.dummy_ema_model.load_state_dict(dummy_ema_state)
-
-                            # Validation loop
-                            for data, cond in tqdm(self.val_dl, total= len(self.val_dl), desc = 'validation loop', disable = not accelerator.is_main_process):
-                                data = data.to(device, non_blocking = True)
-                                cond = cond.to(device, non_blocking = True)
-
-                                predict = self.dummy_ema_model.sample_with_class(
-                                    classes = cond,
-                                )
-
-                                SNR = cal_SNR(predict, data)
-                                SNR_sum += torch.sum(SNR)
-                            
-                            gathered_SNR = accelerator.gather_for_metrics(SNR_sum)
-                            if accelerator.is_main_process:
-                                SNR = torch.sum(gathered_SNR).item() / self.val_dl_len
-                                accelerator.print(f'SNR: {SNR:.2f}')
-                                if self.tensor_writer is not None:
-                                    self.tensor_writer.add_scalar('SNR', SNR, self.step)
-                        
-                        # save model
-                        milestone = self.step // self.save_and_sample_every
-                        if self.accelerator.is_main_process:
-                            if self.save_best_and_latest_only:
-                                if self.best_SNR > SNR:
-                                    self.best_SNR = SNR
-                                    self.save("best")
-                                self.save("latest")
-                            else:
-                                self.save(milestone)
-
-                        if self.tensor_writer is not None:
-                            self.tensor_writer.flush()
-
-                        accelerator.wait_for_everyone()
-
-        accelerator.print('training complete')
-
-    def __del__(self):
-        if self.tensor_writer is not None:
-            self.tensor_writer.close()
-        self.accelerator.end_training()
-
-
-# example
-
-# if __name__ == '__main__':
-#     num_classes = 10
-
-#     model = Unet(
-#         dim = 64,
-#         dim_mults = (1, 2, 4, 8),
-#         num_classes = num_classes,
-#         cond_drop_prob = 0.5
-#     )
-
-#     diffusion = GaussianDiffusion(
-#         model,
-#         image_size = 128,
-#         timesteps = 1000
-#     ).cuda()
-
-#     training_images = torch.randn(8, 3, 128, 128).cuda() # images are normalized from 0 to 1
-#     image_classes = torch.randint(0, num_classes, (8,)).cuda()    # say 10 classes
-
-#     loss = diffusion(training_images, classes = image_classes)
-#     loss.backward()
-
-#     # do above for many steps
-
-#     sampled_images = diffusion.sample(
-#         classes = image_classes,
-#         cond_scale = 6.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
-#     )
-
-#     sampled_images.shape # (8, 3, 128, 128)
-
-#     # interpolation
-
-#     interpolate_out = diffusion.interpolate(
-#         training_images[:1],
-#         training_images[:1],
-#         image_classes[:1]
-#     )
-
