@@ -83,6 +83,7 @@ def __main__():
                     save_best_and_latest_only=True,   # only save the best and the latest model
                     tensorboard_log=tensorboard_log_name,             # log training to tensorboard
                     tensorboard_log_steps=64,         # log training to tensorboard every 100 steps
+                    complex_dim=-3,
                     )
     torch.manual_seed(0)
     trainer.train()

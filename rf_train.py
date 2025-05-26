@@ -18,8 +18,8 @@ def __main__():
     validation_datafiles = ["../ssddata/RENEW/ArgosCSI-96x2-2016-12-07-03-00-36_rotation_mob_horizontal_omni"]
 
 
-    dataset = Five_G_dataset.Five_G_dataset(data_path=training_datafiles, return_complex=False, real_dim=-3, transpose=(1, 0, 2))
-    val_dataset = Five_G_dataset.Five_G_dataset(data_path=validation_datafiles, return_complex=False, real_dim=-3, transpose=(1, 0, 2))
+    dataset = Five_G_dataset.Five_G_dataset(data_path=training_datafiles, transpose=(0, 2, 1))
+    val_dataset = Five_G_dataset.Five_G_dataset(data_path=validation_datafiles, transpose=(0, 2, 1))
 
     params = all_params[2]
 
@@ -36,11 +36,12 @@ def __main__():
     import datetime
     now = datetime.datetime.now()
     current_time = now.strftime("%Y-%m-%d_%H-%M-%S")
-
-    current_time = "Test"
+    # current_time = "2025-05-24_01-36-22"
     
-    results_folder: str = "./results/"+current_time
-    tensorboard_log_name = './log/snr_test/'+current_time
+    tag = "_RF-diffusion_Predict_x0"
+    # tag = ""
+    results_folder: str = "./results/"+current_time+tag
+    tensorboard_log_name = './log/snr_test/'+current_time+tag
     
     trainer = Trainer(diffusion, 
                     dataset,
@@ -58,7 +59,7 @@ def __main__():
                     tensorboard_log=tensorboard_log_name,             # log training to tensorboard
                     tensorboard_log_steps=64,         # log training to tensorboard every 100 steps
                     )
-    
+    # trainer.load("latest")
     torch.manual_seed(0)
     trainer.train()
     # # after a lot of training

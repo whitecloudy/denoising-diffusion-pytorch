@@ -36,11 +36,15 @@ ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 # helpers functions
 @torch.inference_mode()
-def cal_SNR(predict, truth):
+def cal_SNR(predict, truth, complex_dim):
     # Recombine the real and imaginary parts to form complex values
-    real_imag_dim_line = predict.shape[1]//2
-    predict_complex = (predict[:,:real_imag_dim_line,:,:] + 1j * predict[:,real_imag_dim_line:,:,:])
-    truth_complex = (truth[:,:real_imag_dim_line,:,:] + 1j * truth[:,real_imag_dim_line:,:,:])
+    assert predict.shape == truth.shape, "The shapes of predict and truth must match."
+    assert predict.shape[complex_dim] % 2 == 0 and truth.shape[complex_dim] % 2 == 0, "The complex dimension must be even."
+    real_imag_dim_line = predict.shape[complex_dim]//2
+    predict = torch.split(predict, real_imag_dim_line, dim=complex_dim)
+    predict_complex = predict[0] + 1j * predict[1]
+    truth = torch.split(truth, real_imag_dim_line, dim=complex_dim)
+    truth_complex = truth[0] + 1j * truth[1]
     PS = torch.sum(torch.abs(truth_complex)**2, dim=(-1, -2, -3))  # power of signal
     PN = torch.sum(torch.abs(predict_complex - truth_complex)**2, dim=(-1, -2, -3))  # power of noise
     ratio = PS / PN
@@ -820,7 +824,6 @@ class GaussianDiffusion(nn.Module):
         )
 
     def p_losses(self, x_start, t, *, classes, noise = None):
-        b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
@@ -873,10 +876,7 @@ class Trainer:
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        convert_image_to = None,
-        # calculate_fid = True,
-        # fid_batch_size = None,
-        # inception_block_idx = 2048,
+        complex_dim = -1,
         max_grad_norm = 1.,
         # num_fid_samples = 50000,
         save_best_and_latest_only = False,
@@ -936,7 +936,7 @@ class Trainer:
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
-
+        self.complex_dim = complex_dim
         # if self.accelerator.is_main_process:
         #     self.val_ds = validation_dataset
 
@@ -1105,7 +1105,7 @@ class Trainer:
                                 loss = reduce(loss, 'b ... -> b', 'mean')
                                 loss_sum += torch.sum(loss)
 
-                                SNR = cal_SNR(predict, data)
+                                SNR = cal_SNR(predict, data, complex_dim = self.complex_dim)
                                 SNR_sum += torch.sum(SNR)
                             
                             gathered_SNR = accelerator.gather_for_metrics(SNR_sum)

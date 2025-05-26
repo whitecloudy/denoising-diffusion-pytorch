@@ -39,18 +39,6 @@ from Five_G_dataset import Five_G_dataset
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
-# helpers functions
-@torch.inference_mode()
-def cal_SNR(predict, truth):
-    # Recombine the real and imaginary parts to form complex values
-    real_imag_dim_line = predict.shape[-3]//2
-    predict_complex = (predict[:,:real_imag_dim_line,:,:] + 1j * predict[:,real_imag_dim_line:,:,:])
-    truth_complex = (truth[:,:real_imag_dim_line,:,:] + 1j * truth[:,real_imag_dim_line:,:,:])
-    PS = torch.sum(torch.abs(truth_complex)**2, dim=(-1, -2, -3))  # power of signal
-    PN = torch.sum(torch.abs(predict_complex - truth_complex)**2, dim=(-1, -2, -3))  # power of noise
-    ratio = PS / PN
-    return 10 * torch.log10(ratio)
-
 def exists(x):
     return x is not None
 
@@ -399,9 +387,10 @@ def extract(a, t, x_shape):
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 def linear_beta_schedule(timesteps):
-    scale = 1000 / timesteps
-    beta_start = scale * 0.0001
-    beta_end = scale * 0.02
+    # TODO: Forcing our scheduler for now
+    # scale = 1000 / timesteps
+    beta_start = 5e-4
+    beta_end = 0.1
     return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
 
 def cosine_beta_schedule(timesteps, s = 0.008):
@@ -554,18 +543,7 @@ class GaussianDiffusion(nn.Module):
     
 
     def model_forward(self, x, t, classes):
-        x = torch.transpose(x, -3, -2)
-        classes = torch.transpose(classes, -3, -2)
-        x = Five_G_dataset.real_to_complex(x, dim = -2)
-        classes = Five_G_dataset.real_to_complex(classes, dim = -2)
-        x = torch.transpose(x, -3, -2)
-        classes = torch.transpose(classes, -3, -2)
-
         model_out = self.model.forward(x, t, classes)
-
-        model_out = torch.transpose(model_out, -3, -2)
-        model_out = Five_G_dataset.complex_to_real(model_out, dim = -2)
-        model_out = torch.transpose(model_out, -3, -2)
         return model_out
 
 
@@ -608,7 +586,7 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample(self, x, t: int, classes, clip_denoised = True):
-        b, *_, device = *x.shape, x.device
+        b, device = x.shape[0], x.device
         batched_times = torch.full((x.shape[0],), t, device = x.device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, classes = classes, clip_denoised = clip_denoised)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
@@ -666,7 +644,7 @@ class GaussianDiffusion(nn.Module):
     def sample_with_class(self, classes):
         batch_size, data_shape = classes.shape[0], self.data_shape
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn(classes, (batch_size, data_shape[0], data_shape[1], data_shape[2]))
+        return sample_fn(classes, (batch_size, *data_shape))
 
     # # sample with random classes
     # @torch.inference_mode()
@@ -705,7 +683,6 @@ class GaussianDiffusion(nn.Module):
         )
 
     def p_losses(self, x_start, t, *, classes, noise = None):
-        b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
@@ -730,8 +707,9 @@ class GaussianDiffusion(nn.Module):
         return loss.mean()
 
     def forward(self, img, *args, **kwargs):
-        b, d_0, d_1, d_2, device, data_shape = *img.shape, img.device, self.data_shape
-        assert d_0 == data_shape[0] and d_1 == data_shape[1] and d_2 == data_shape[2], f'height and width of image must be {data_shape}'
+        shape, device, data_shape = img.shape, img.device, self.data_shape
+        b = shape[0]
+        assert shape[1] == data_shape[0] and shape[2] == data_shape[1] and shape[3] == data_shape[2], f'height and width of image must be {data_shape}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         return self.p_losses(img, t, *args, **kwargs)
