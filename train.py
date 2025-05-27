@@ -4,7 +4,8 @@ from torchvision.datasets import CIFAR10
 import torchvision.transforms as transforms
 import tensorboard
 
-from denoising_diffusion_pytorch.classifier_free_guidance import Unet, GaussianDiffusion, Trainer
+from denoising_diffusion_pytorch.classifier_free_guidance import Unet, GaussianDiffusion
+from denoising_diffusion_pytorch.RF_trainer import Trainer
 
 from absl import app, flags
 

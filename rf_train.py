@@ -5,7 +5,7 @@ import torchvision.transforms as transforms
 import tensorboard
 
 from denoising_diffusion_pytorch.rf_diffusion import tfdiff_mimo, GaussianDiffusion
-from denoising_diffusion_pytorch.classifier_free_guidance import Trainer
+from denoising_diffusion_pytorch.RF_trainer import Trainer
 from denoising_diffusion_pytorch.params import all_params
 
 from absl import app, flags

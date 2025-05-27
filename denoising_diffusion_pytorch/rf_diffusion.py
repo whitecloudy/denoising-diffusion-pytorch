@@ -1,13 +1,8 @@
 import math
-import copy
-from datetime import timedelta
-from pathlib import Path
 from random import random
 from functools import partial
 from collections import namedtuple
-from multiprocessing import cpu_count
 
-import tempfile
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
@@ -15,18 +10,10 @@ from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter, writer
 from torch.utils.data import Dataset, DataLoader
 
-from torch.optim import Adam
-from ema_pytorch import EMA
-
-
 from torchvision import transforms as T, utils
 
 from einops import rearrange, reduce, repeat, pack, unpack
 from einops.layers.torch import Rearrange
-
-from denoising_diffusion_pytorch.version import __version__
-from accelerate import Accelerator, InitProcessGroupKwargs
-import accelerate
 
 from tqdm.auto import tqdm
 
@@ -49,11 +36,6 @@ def default(val, d):
 
 def identity(t, *args, **kwargs):
     return t
-
-def cycle(dl):
-    while True:
-        for data in dl:
-            yield data
 
 def divisible_by(numer, denom):
     return (numer % denom) == 0
@@ -388,9 +370,11 @@ def extract(a, t, x_shape):
 
 def linear_beta_schedule(timesteps):
     # TODO: Forcing our scheduler for now
-    # scale = 1000 / timesteps
-    beta_start = 5e-4
-    beta_end = 0.1
+    scale = 1000 / timesteps
+    beta_start = scale * 0.0001
+    beta_end = scale * 0.02
+    # beta_start = 5e-4
+    # beta_end = 0.1
     return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
 
 def cosine_beta_schedule(timesteps, s = 0.008):
