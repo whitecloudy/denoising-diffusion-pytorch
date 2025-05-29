@@ -50,9 +50,9 @@ def cal_SNR(predict, truth, complex_dim):
     assert predict.shape[complex_dim] % 2 == 0 and truth.shape[complex_dim] % 2 == 0, "The complex dimension must be even."
     real_imag_dim_line = predict.shape[complex_dim]//2
     predict = torch.split(predict, real_imag_dim_line, dim=complex_dim)
-    predict_complex = predict[0] + 1j * predict[1]
+    predict_complex = (predict[0] + 1j * predict[1]).squeeze(dim=complex_dim)
     truth = torch.split(truth, real_imag_dim_line, dim=complex_dim)
-    truth_complex = truth[0] + 1j * truth[1]
+    truth_complex = (truth[0] + 1j * truth[1]).squeeze(dim=complex_dim)
     PS = torch.sum(torch.abs(truth_complex)**2, dim=(-1, -2, -3))  # power of signal
     PN = torch.sum(torch.abs(predict_complex - truth_complex)**2, dim=(-1, -2, -3))  # power of noise
     ratio = PS / PN
