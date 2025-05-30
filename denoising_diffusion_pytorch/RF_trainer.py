@@ -269,14 +269,15 @@ class Trainer:
 
                 self.step += 1
 
-                if (self.tensor_writer is not None) and (self.step % self.tensor_board_log_steps == 0):
-                    self.tensor_writer.add_scalar('Train/loss', total_loss/self.tensor_board_log_steps, self.step)
-                    total_loss = 0.
-
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.grad_norm = accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                 self.opt.step()
                 self.opt.zero_grad()
+
+                if (self.tensor_writer is not None) and (self.step % self.tensor_board_log_steps == 0):
+                    self.tensor_writer.add_scalar('Train/loss', total_loss/self.tensor_board_log_steps, self.step)
+                    self.tensor_writer.add_scalar('Train/grad_norm', self.grad_norm, self.step)
+                    total_loss = 0.
 
                 pbar.update(1)
                 if accelerator.is_main_process:
