@@ -133,12 +133,11 @@ class Trainer:
         self.ds = dataset
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
-
         dl = DataLoader(self.ds, 
                         batch_size = train_batch_size,
                         shuffle = True, 
                         pin_memory = True, 
-                        num_workers = cpu_count()//2, 
+                        num_workers = min(cpu_count()//self.accelerator.num_processes , train_batch_size//self.accelerator.num_processes), # use at most 8 workers
                         persistent_workers=True,)
 
         dl = self.accelerator.prepare(dl)
@@ -157,7 +156,7 @@ class Trainer:
         # prepare validation dataset and dataloader
         self.val_ds = validation_dataset
         if self.val_ds is not None:
-            self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
+            self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count()//self.accelerator.num_processes)
             self.val_dl_len = len(self.val_ds)
             self.val_dl = self.accelerator.prepare(self.val_dl)
 
