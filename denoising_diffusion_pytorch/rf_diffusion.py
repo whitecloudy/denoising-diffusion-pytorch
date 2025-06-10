@@ -374,8 +374,6 @@ def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps
     beta_start = scale * 0.0001
     beta_end = scale * 0.02
-    # beta_start = 5e-4
-    # beta_end = 0.1
     return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
 
 def cosine_beta_schedule(timesteps, s = 0.008):
@@ -791,7 +789,7 @@ class SignalDiffusion(nn.Module):
                                                   diffusion_steps=timesteps, 
                                                   gamma_weights=gamma_weights, 
                                                   sigma_weights=sigma_weights)
-        sigma_weights_bar_prev = torch.cat([torch.ones_like(sigma_weights_bar[0]).unsqueeze(0), (sigma_weights_bar[:-1])], dim=0)
+        sigma_weights_bar_prev = torch.cat([torch.zeros_like(sigma_weights_bar[0]).unsqueeze(0), (sigma_weights_bar[:-1])], dim=0)
         
         # helper function to register buffer from float64 to float32
         register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
@@ -956,14 +954,18 @@ class SignalDiffusion(nn.Module):
     def p_sample_loop(self, classes, shape):
         batch, device = shape[0], self.betas.device
 
-        img = torch.randn(shape, device=device)
-
+        x_T = torch.randn(shape, device=device)
+        batch_max = ((self.sampling_timesteps-1)*torch.ones(batch, dtype=torch.int64)).to(device)
+        
+        inf_weight = extract(self.sigma_weights_bar, batch_max, x_T.shape) + \
+                     extract(self.gamma_weights_bar, batch_max, x_T.shape)
+        x_T = x_T * inf_weight
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps, disable=self.tqdm_disable):
-            img, x_start = self.p_sample(img, t, classes)
+            x_T, x_start = self.p_sample(x_T, t, classes)
 
-        return img
+        return x_T
 
     #TODO : Need to fix for SignalDiffusion
     @torch.inference_mode()
