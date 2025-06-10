@@ -365,8 +365,9 @@ class tfdiff_mimo(nn.Module):
 
 def extract(a, t, x_shape):
     b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+    out = a.index_select(0, t)
+    new_shape = out.shape + (1,) * (len(x_shape) - len(out.shape))
+    return out.reshape(new_shape)
 
 def linear_beta_schedule(timesteps):
     # TODO: Forcing our scheduler for now
@@ -699,6 +700,28 @@ class GaussianDiffusion(nn.Module):
         return self.p_losses(img, t, *args, **kwargs)
 
 
+@torch.inference_mode()
+def get_kernel(blur_kernel, input_dim):
+    samples = torch.arange(0, input_dim) # [N]
+    gaussian_kernel = torch.exp(-((samples - input_dim // 2)**2) / (2 * blur_kernel))
+    # gaussian_kernel = torch.exp(-((samples - self.input_dim // 2)**2) / (2 * var_kernel)) / torch.sqrt(2 * torch.pi * var_kernel) # G_t, [T, N]
+    # gaussian_kernel = self.input_dim * gaussian_kernel / torch.sum(gaussian_kernel, dim=1, keepdim=True) # Normalized G_t, [T, N]
+    return gaussian_kernel
+
+@torch.inference_mode()
+def get_sigma_bar_weights(input_dim: int, diffusion_steps: int, gamma_weights, sigma_weights):
+    noise_weights = []
+    noise_weight_square = torch.zeros(input_dim) # [N]
+
+    for t in range(diffusion_steps):
+        noise_weight_square *= (gamma_weights[t] ** 2)
+        noise_weight_square += (torch.ones(input_dim) * sigma_weights[t] ** 2)
+        noise_weights.append(torch.sqrt(noise_weight_square).clone().detach())
+
+    return torch.stack(noise_weights, dim=0) # [T, N] 
+
+
+
 class SignalDiffusion(nn.Module):
     def __init__(
         self,
@@ -756,22 +779,24 @@ class SignalDiffusion(nn.Module):
         freq_kernel = (input_time_dim / freq_blur).unsqueeze(1)
         freq_kernel_bar = (input_time_dim / freq_blur_bar).unsqueeze(1)
 
-        gaussian_kernel = self.get_kernel(freq_kernel, input_time_dim)
-        gaussian_kernel_bar = self.get_kernel(freq_kernel_bar, input_time_dim)
+        gaussian_kernel = get_kernel(freq_kernel, input_time_dim)
+        gaussian_kernel_bar = get_kernel(freq_kernel_bar, input_time_dim)
 
         gamma_weights = gaussian_kernel * torch.sqrt(alphas).unsqueeze(1)
         gamma_weights_bar = gaussian_kernel_bar * torch.sqrt(alphas_cumprod).unsqueeze(1)
         gamma_weights_bar_prev = torch.cat([torch.ones_like(gamma_weights_bar[0]).unsqueeze(0), (gamma_weights_bar[:-1])], dim=0)
 
-        sigma_weights = torch.sqrt(betas)
-        sigma_weights_bar = self.get_sigma_bar_weights(input_dim=input_time_dim, 
-                                                       diffusion_steps=timesteps, 
-                                                       gamma_weights=gamma_weights, 
-                                                       sigma_weights=sigma_weights)
+        sigma_weights = torch.sqrt(betas).unsqueeze(1)
+        sigma_weights_bar = get_sigma_bar_weights(input_dim=input_time_dim, 
+                                                  diffusion_steps=timesteps, 
+                                                  gamma_weights=gamma_weights, 
+                                                  sigma_weights=sigma_weights)
         sigma_weights_bar_prev = torch.cat([torch.ones_like(sigma_weights_bar[0]).unsqueeze(0), (sigma_weights_bar[:-1])], dim=0)
         
         # helper function to register buffer from float64 to float32
         register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+
+        register_buffer('betas', betas)
 
         register_buffer('gamma_weights', gamma_weights)
         register_buffer('gamma_weights_bar', gamma_weights_bar)
@@ -790,7 +815,6 @@ class SignalDiffusion(nn.Module):
                         1. / (gamma_weights_bar**2 + sigma_weights_bar**2))
 
         #TODO : REPLACE
-        # register_buffer('betas', betas)
         # register_buffer('alphas_cumprod', alphas_cumprod)
         # register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
 
@@ -823,7 +847,7 @@ class SignalDiffusion(nn.Module):
 
         # loss weight
 
-        snr = alphas_cumprod / (1 - alphas_cumprod)
+        snr = gamma_weights_bar / sigma_weights_bar
 
         maybe_clipped_snr = snr.clone()
         if min_snr_loss_weight:
@@ -837,29 +861,6 @@ class SignalDiffusion(nn.Module):
             loss_weight = maybe_clipped_snr / (snr + 1)
 
         register_buffer('loss_weight', loss_weight)
-
-    @torch.inference_mode()
-    @staticmethod
-    def get_kernel(blur_kernel, input_dim):
-        samples = torch.arange(0, input_dim) # [N]
-        gaussian_kernel = torch.exp(-((samples - input_dim // 2)**2) / (2 * blur_kernel))
-        # gaussian_kernel = torch.exp(-((samples - self.input_dim // 2)**2) / (2 * var_kernel)) / torch.sqrt(2 * torch.pi * var_kernel) # G_t, [T, N]
-        # gaussian_kernel = self.input_dim * gaussian_kernel / torch.sum(gaussian_kernel, dim=1, keepdim=True) # Normalized G_t, [T, N]
-        return gaussian_kernel
-
-    @torch.inference_mode()
-    @staticmethod
-    def get_sigma_bar_weights(input_dim: int, diffusion_steps: int, gamma_weights, sigma_weights):
-        noise_weights = []
-        noise_weight_square = torch.zeros(input_dim) # [N]
-
-        for t in range(diffusion_steps):
-            noise_weight_square *= (gamma_weights[t] ** 2)
-            noise_weight_square += (torch.ones(input_dim) * sigma_weights[t] ** 2)
-            noise_weights.append(torch.sqrt(noise_weight_square).clone().detach())
-
-        return torch.stack(noise_weights, dim=0) # [T, N] 
-
 
     @property
     def device(self):
@@ -1061,7 +1062,7 @@ class SignalDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
         loss = F.mse_loss(model_out, target, reduction = 'none')
-        loss = reduce(loss, 'b ... -> b', 'mean')
+        loss = reduce(loss, 'b t ... -> b t', 'mean')
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
