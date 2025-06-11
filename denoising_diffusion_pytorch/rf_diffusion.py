@@ -845,7 +845,7 @@ class SignalDiffusion(nn.Module):
 
         # loss weight
 
-        snr = gamma_weights_bar / sigma_weights_bar
+        snr = (gamma_weights_bar / sigma_weights_bar)
 
         maybe_clipped_snr = snr.clone()
         if min_snr_loss_weight:
