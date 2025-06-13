@@ -736,6 +736,7 @@ class SignalDiffusion(nn.Module):
         min_snr_gamma = 5,
         tqdm_disable = False,
         freq_blur = None,
+        use_loss_weights = True
     ):
         super().__init__()
 
@@ -844,21 +845,23 @@ class SignalDiffusion(nn.Module):
         self.offset_noise_strength = offset_noise_strength
 
         # loss weight
+        self.use_loss_weights = use_loss_weights
 
-        snr = (gamma_weights_bar / sigma_weights_bar)**2
+        if self.use_loss_weights:
+            snr = (gamma_weights_bar / sigma_weights_bar)**2
 
-        maybe_clipped_snr = snr.clone()
-        if min_snr_loss_weight:
-            maybe_clipped_snr.clamp_(max = min_snr_gamma)
+            maybe_clipped_snr = snr.clone()
+            if min_snr_loss_weight:
+                maybe_clipped_snr.clamp_(max = min_snr_gamma)
 
-        if objective == 'pred_noise':
-            loss_weight = maybe_clipped_snr / snr
-        elif objective == 'pred_x0':
-            loss_weight = maybe_clipped_snr
-        elif objective == 'pred_v':
-            loss_weight = maybe_clipped_snr / (snr + 1)
-
-        register_buffer('loss_weight', loss_weight)
+            if objective == 'pred_noise':
+                loss_weight = maybe_clipped_snr / snr
+            elif objective == 'pred_x0':
+                loss_weight = maybe_clipped_snr
+            elif objective == 'pred_v':
+                loss_weight = maybe_clipped_snr / (snr + 1)
+            
+            register_buffer('loss_weight', loss_weight)
 
     @property
     def device(self):
@@ -1064,9 +1067,10 @@ class SignalDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
         loss = F.mse_loss(model_out, target, reduction = 'none')
-        loss = reduce(loss, 'b t ... -> b t', 'mean')
+        if self.use_loss_weights:
+            loss = reduce(loss, 'b t ... -> b t', 'mean')
 
-        loss = loss * extract(self.loss_weight, t, loss.shape)
+            loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
     def forward(self, img, *args, **kwargs):
