@@ -24,6 +24,25 @@ import copy
 from denoising_diffusion_pytorch.version import __version__
 from tqdm.auto import tqdm
 
+import re
+
+def read_python_file_cleaned(filepath):
+    with open(filepath, 'r', encoding='utf-8') as f:
+        code = f.read()
+
+    # 1. 멀티라인 주석 제거 (''' ''' 또는 """ """)
+    code = re.sub(r"'''[\s\S]*?'''", '', code)
+    code = re.sub(r'"""[\s\S]*?"""', '', code)
+
+    # 2. 한 줄 주석 제거 (// 또는 #)
+    code = re.sub(r'#.*', '', code)
+
+    # 3. 여러 줄 공백을 하나의 줄로 압축
+    code = re.sub(r'\n\s*\n+', '\n\n', code)
+
+    # 4. 양 끝 공백 제거
+    return code.strip()
+
 
 def exists(x):
     return x is not None
@@ -109,6 +128,9 @@ class Trainer:
             self.tensor_writer = SummaryWriter(log_dir=tensorboard_log)
             self.tensor_writer.add_text('git_info', 
                                         f'commit: {repo.head.commit.hexsha}\nbranch: {repo.active_branch.name}\ndirty: {repo.is_dirty()}')
+            import sys
+            self.tensor_writer.add_text('python_info', 
+                                        f'python version: {sys.version}\nfile: {read_python_file_cleaned(__file__)}')
         else:
             self.tensor_writer = None
 
