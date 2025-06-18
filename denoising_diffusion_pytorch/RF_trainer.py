@@ -144,7 +144,7 @@ class Trainer:
 
         self.save_and_sample_every = save_and_sample_every
 
-        self.batch_size = train_batch_size
+        self.batch_size = train_batch_size // self.accelerator.num_processes
         self.gradient_accumulate_every = gradient_accumulate_every
         # assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
 
@@ -156,10 +156,10 @@ class Trainer:
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
         dl = DataLoader(self.ds, 
-                        batch_size = train_batch_size,
+                        batch_size = self.batch_size,
                         shuffle = True, 
                         pin_memory = True, 
-                        num_workers = min(cpu_count()//self.accelerator.num_processes , train_batch_size//self.accelerator.num_processes), # use at most 8 workers
+                        num_workers = min(cpu_count()//self.accelerator.num_processes , self.batch_size), # use at most 8 workers
                         persistent_workers=True,)
 
         dl = self.accelerator.prepare(dl)
@@ -174,11 +174,12 @@ class Trainer:
         #         self.val_dl = None
         # else:
         #     self.val_dl = None
+        self.validation_batch_size = validation_batch_size//self.accelerator.num_processes
 
         # prepare validation dataset and dataloader
         self.val_ds = validation_dataset
         if self.val_ds is not None:
-            self.val_dl = DataLoader(self.val_ds, batch_size = validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count()//self.accelerator.num_processes)
+            self.val_dl = DataLoader(self.val_ds, batch_size = self.validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count()//self.accelerator.num_processes)
             self.val_dl_len = len(self.val_ds)
             self.val_dl = self.accelerator.prepare(self.val_dl)
 
@@ -214,8 +215,6 @@ class Trainer:
         # prepare model, dataloader, optimizer with accelerator
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
-
-        self.validation_batch_size = validation_batch_size
 
         if save_best_and_latest_only:
             self.best_SNR = 1e10 # infinite
