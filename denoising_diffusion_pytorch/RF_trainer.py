@@ -130,7 +130,7 @@ class Trainer:
                                         f'commit: {repo.head.commit.hexsha}\nbranch: {repo.active_branch.name}\ndirty: {repo.is_dirty()}')
             import sys
             self.tensor_writer.add_text('python_info', 
-                                        f'python version: {sys.version}\nfile: {read_python_file_cleaned(__file__)}')
+                                        f'python version: {sys.version}\nfile: {read_python_file_cleaned(sys.argv[0])}')
         else:
             self.tensor_writer = None
 
