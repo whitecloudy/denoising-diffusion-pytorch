@@ -314,7 +314,7 @@ class TimeFrequencyDiffusion(nn.Module):
     def forward(self, x, t, c):
         x = self.p_embed(x)
         t = self.t_embed(t)
-        c = c.reshape([-1, self.input_len, 2496, 2])
+        c = c.reshape([-1, self.input_len, self.output_dim, 2])
         c = self.c_embed(c)
         for block in self.blocks:
             x = block(x, t, c)
