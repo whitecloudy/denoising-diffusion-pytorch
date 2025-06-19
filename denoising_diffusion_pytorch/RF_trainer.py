@@ -25,6 +25,7 @@ from denoising_diffusion_pytorch.version import __version__
 from tqdm.auto import tqdm
 
 import re
+import html
 
 def read_python_file_cleaned(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -41,8 +42,11 @@ def read_python_file_cleaned(filepath):
     code = re.sub(r'\n\s*\n+', '\n\n', code)
 
     # 4. 양 끝 공백 제거
-    return code.strip()
+    cleaned_code = code.strip()
 
+    # 5. Markdown 코드 블록 포맷으로 감싸기
+    markdown_code_block = f"\n```python\n{cleaned_code}\n```"
+    return markdown_code_block
 
 def exists(x):
     return x is not None
