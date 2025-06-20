@@ -93,6 +93,7 @@ class Trainer:
         validation_batch_size = 16,
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
+        train_lr_decay = 0.0,
         train_num_steps = 100000,
         ema_update_every = 10,
         ema_decay = 0.995,
@@ -197,7 +198,7 @@ class Trainer:
 
         # optimizer
 
-        self.opt = Adam(self.model.parameters(), lr = train_lr, betas = adam_betas)
+        self.opt = Adam(self.model.parameters(), lr = train_lr, betas = adam_betas, weight_decay=train_lr_decay)
 
         # for logging results in a folder periodically
 
@@ -221,7 +222,7 @@ class Trainer:
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
         if save_best_and_latest_only:
-            self.best_SNR = 1e10 # infinite
+            self.best_SNR = -1e10 # infinite
 
         self.save_best_and_latest_only = save_best_and_latest_only
 
@@ -354,7 +355,7 @@ class Trainer:
                         milestone = self.step // self.save_and_sample_every
                         if self.accelerator.is_main_process:
                             if self.save_best_and_latest_only:
-                                if self.best_SNR > SNR:
+                                if self.best_SNR < SNR:
                                     self.best_SNR = SNR
                                     self.save("best")
                                 self.save("latest")
