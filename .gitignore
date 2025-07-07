@@ -133,3 +133,6 @@ dmypy.json
 
 # log directory
 log/
+
+# data directory
+data/

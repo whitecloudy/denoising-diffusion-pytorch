@@ -965,7 +965,7 @@ class Trainer:
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        dl = DataLoader(self.ds, batch_size = self.batch_size, shuffle = True, pin_memory = True, num_workers = self.batch_size)
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -1086,7 +1086,7 @@ class Trainer:
                 self.model.train()
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
+                    data = next(self.dl).to(device, non_blocking = True)
 
                     with self.accelerator.autocast():
                         loss = self.model(data)
