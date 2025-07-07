@@ -26,7 +26,7 @@ from PIL import Image
 from tqdm.auto import tqdm
 from ema_pytorch import EMA
 
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 
 from denoising_diffusion_pytorch.tensorboard_logger import Tensorboard_logger
 
@@ -61,8 +61,8 @@ def identity(t, *args, **kwargs):
 
 def cycle(dl):
     while True:
-        for data in dl:
-            yield data
+        for x, y in dl:
+            yield x
 
 def has_int_squareroot(num):
     return (math.sqrt(num) ** 2) == num
@@ -884,7 +884,7 @@ class Trainer:
     def __init__(
         self,
         diffusion_model,
-        folder,
+        dataset,
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
@@ -906,20 +906,29 @@ class Trainer:
         max_grad_norm = 1.,
         num_fid_samples = 50000,
         save_best_and_latest_only = False,
-        tensorboard_log_dir = "/dev/null",
+        tensorboard_log = None,
         tensorboard_log_steps = 128,
     ):
         super().__init__()
+        from datetime import timedelta
 
         # accelerator
+        ipg_handler = InitProcessGroupKwargs(
+            timeout=timedelta(hours=12),
+        )
+
 
         self.accelerator = Accelerator(
+            kwargs_handlers=[ipg_handler],
             split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no'
         )
 
         # tensorboard log
-        self.tensor_writer = Tensorboard_logger(log_dir=tensorboard_log_dir, enable=self.accelerator.is_main_process)
+        if tensorboard_log is not None and self.accelerator.is_main_process:
+            self.tensor_writer = Tensorboard_logger(log_dir=tensorboard_log)
+        else:
+            self.tensor_writer = None
         self.tensorboard_log_steps = tensorboard_log_steps
 
         # model
@@ -939,7 +948,9 @@ class Trainer:
         self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
 
-        self.batch_size = train_batch_size
+        num_of_process = self.accelerator.num_processes
+        self.total_batch_size = train_batch_size
+        self.batch_size = train_batch_size//num_of_process
         self.gradient_accumulate_every = gradient_accumulate_every
         assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
 
@@ -950,7 +961,7 @@ class Trainer:
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        self.ds = dataset
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
@@ -970,7 +981,7 @@ class Trainer:
             self.ema.to(self.device)
 
         self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(exist_ok = True)
+        self.results_folder.mkdir(parents=True, exist_ok = True)
 
         # step counter state
 
@@ -993,8 +1004,8 @@ class Trainer:
                     "Consider using DDIM sampling to save time."
                 )
 
-            self.fid_scorer = FIDEvaluation(
-                batch_size=self.batch_size,
+            self.ema_fid_scorer = FIDEvaluation(
+                batch_size=self.total_batch_size,
                 dl=self.dl,
                 sampler=self.ema.ema_model,
                 channels=self.channels,
@@ -1004,6 +1015,19 @@ class Trainer:
                 num_fid_samples=num_fid_samples,
                 inception_block_idx=inception_block_idx
             )
+
+            self.fid_scorer = FIDEvaluation(
+                batch_size=self.total_batch_size,
+                dl=self.dl,
+                sampler=self.model,
+                channels=self.channels,
+                accelerator=self.accelerator,
+                stats_dir=results_folder,
+                device=self.device,
+                num_fid_samples=num_fid_samples,
+                inception_block_idx=inception_block_idx
+            )
+
 
         if save_best_and_latest_only:
             assert calculate_fid, "`calculate_fid` must be True to provide a means for model evaluation for `save_best_and_latest_only`."
@@ -1078,13 +1102,14 @@ class Trainer:
 
                 pbar.set_description(f'loss: {cum_loss:.4f}')
 
-                if self.step % self.tensorboard_log_steps == 0:
-                    self.tensor_writer.add_scalar('Train/loss', total_loss/self.tensor_board_log_steps, self.step)
+                self.grad_norm = accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                if (self.step % self.tensorboard_log_steps == 0) and (self.tensor_writer is not None):
+                    self.tensor_writer.add_scalar('Train/loss', total_loss/self.tensorboard_log_steps, self.step)
                     self.tensor_writer.add_scalar('Train/grad_norm', self.grad_norm, self.step)
-                    total_loss = 0.
+                total_loss = 0.
 
                 accelerator.wait_for_everyone()
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                 self.opt.step()
                 self.opt.zero_grad()
@@ -1110,13 +1135,19 @@ class Trainer:
                         # whether to calculate fid
 
                         if self.calculate_fid:
+                            ema_fid_score = self.ema_fid_scorer.fid_score()
+                            accelerator.print(f'ema fid_score: {ema_fid_score}')
+
                             fid_score = self.fid_scorer.fid_score()
                             accelerator.print(f'fid_score: {fid_score}')
-                            self.tensor_writer.add_scalar('Validation/fid_score', fid_score, self.step)
+
+                            if self.tensor_writer is not None:
+                                self.tensor_writer.add_scalar('Validation/ema_fid_score', ema_fid_score, self.step)
+                                self.tensor_writer.add_scalar('Validation/fid_score', fid_score, self.step)
 
                         if self.save_best_and_latest_only:
-                            if self.best_fid > fid_score:
-                                self.best_fid = fid_score
+                            if self.best_fid > ema_fid_score:
+                                self.best_fid = ema_fid_score
                                 self.save("best")
                             self.save("latest")
                         else:
