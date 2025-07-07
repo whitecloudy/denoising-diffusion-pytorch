@@ -28,6 +28,8 @@ from ema_pytorch import EMA
 
 from accelerate import Accelerator
 
+from denoising_diffusion_pytorch.tensorboard_logger import Tensorboard_logger
+
 from denoising_diffusion_pytorch.attend import Attend
 
 from denoising_diffusion_pytorch.version import __version__
@@ -491,7 +493,8 @@ class GaussianDiffusion(Module):
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
-        immiscible = False
+        immiscible = False,
+        train_t_minimum = 0
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
@@ -501,6 +504,7 @@ class GaussianDiffusion(Module):
 
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
+        self.train_t_minimum = train_t_minimum
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -835,7 +839,7 @@ class GaussianDiffusion(Module):
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        t = torch.randint(self.train_t_minimum, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
@@ -901,7 +905,9 @@ class Trainer:
         inception_block_idx = 2048,
         max_grad_norm = 1.,
         num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        save_best_and_latest_only = False,
+        tensorboard_log_dir = "/dev/null",
+        tensorboard_log_steps = 128,
     ):
         super().__init__()
 
@@ -911,6 +917,10 @@ class Trainer:
             split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no'
         )
+
+        # tensorboard log
+        self.tensor_writer = Tensorboard_logger(log_dir=tensorboard_log_dir, enable=self.accelerator.is_main_process)
+        self.tensorboard_log_steps = tensorboard_log_steps
 
         # model
 
@@ -1043,13 +1053,13 @@ class Trainer:
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
+        total_loss = 0.
+        cum_loss = None
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
                 self.model.train()
-
-                total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
                     data = next(self.dl).to(device)
@@ -1061,7 +1071,17 @@ class Trainer:
 
                     self.accelerator.backward(loss)
 
-                pbar.set_description(f'loss: {total_loss:.4f}')
+                if cum_loss is None:
+                    cum_loss = loss.item()
+                else:
+                    cum_loss  = cum_loss*0.9 + loss.item()*0.1
+
+                pbar.set_description(f'loss: {cum_loss:.4f}')
+
+                if self.step % self.tensorboard_log_steps == 0:
+                    self.tensor_writer.add_scalar('Train/loss', total_loss/self.tensor_board_log_steps, self.step)
+                    self.tensor_writer.add_scalar('Train/grad_norm', self.grad_norm, self.step)
+                    total_loss = 0.
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1092,6 +1112,7 @@ class Trainer:
                         if self.calculate_fid:
                             fid_score = self.fid_scorer.fid_score()
                             accelerator.print(f'fid_score: {fid_score}')
+                            self.tensor_writer.add_scalar('Validation/fid_score', fid_score, self.step)
 
                         if self.save_best_and_latest_only:
                             if self.best_fid > fid_score:
