@@ -26,15 +26,17 @@ def read_python_file_cleaned(filepath):
 class Tensorboard_logger(SummaryWriter):
     def __init__(self,
                 log_dir : str,
+                init_git_info : bool = True,
                 ):
         super().__init__(log_dir=log_dir)
-        import git
-        repo = git.Repo(search_parent_directories=True)
-        super().add_text('git_info', 
-                                    f'commit: {repo.head.commit.hexsha}\nbranch: {repo.active_branch.name}\ndirty: {repo.is_dirty()}')
-        import sys
-        super().add_text('python_info', 
-                                    f'python version: {sys.version}\nfile: {read_python_file_cleaned(sys.argv[0])}')
+        if init_git_info:
+            import git
+            repo = git.Repo(search_parent_directories=True)
+            super().add_text('git_info', 
+                                        f'commit: {repo.head.commit.hexsha}\nbranch: {repo.active_branch.name}\ndirty: {repo.is_dirty()}')
+            import sys
+            super().add_text('python_info', 
+                                        f'python version: {sys.version}\nfile: {read_python_file_cleaned(sys.argv[0])}')
         
     def __del__(self):
         super().close()

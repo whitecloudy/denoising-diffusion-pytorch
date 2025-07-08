@@ -925,7 +925,7 @@ class Trainer:
         )
 
         # tensorboard log
-        if tensorboard_log is not None and self.accelerator.is_main_process:
+        if (tensorboard_log is not None) and (self.accelerator.is_main_process):
             self.tensor_writer = Tensorboard_logger(log_dir=tensorboard_log)
         else:
             self.tensor_writer = None
@@ -993,40 +993,42 @@ class Trainer:
 
         # FID-score computation
 
-        self.calculate_fid = calculate_fid and self.accelerator.is_main_process
+        self.calculate_fid = calculate_fid
 
         if self.calculate_fid:
             from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
+            if self.accelerator.is_main_process:
 
-            if not is_ddim_sampling:
-                self.accelerator.print(
-                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
-                    "Consider using DDIM sampling to save time."
+                if not is_ddim_sampling:
+                    self.accelerator.print(
+                        "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
+                        "Consider using DDIM sampling to save time."
+                    )
+
+                self.ema_fid_scorer = FIDEvaluation(
+                    batch_size=self.total_batch_size*4,
+                    dl=self.dl,
+                    sampler=self.ema.ema_model,
+                    channels=self.channels,
+                    accelerator=self.accelerator,
+                    stats_dir=results_folder,
+                    device=self.device,
+                    num_fid_samples=num_fid_samples,
+                    inception_block_idx=inception_block_idx
                 )
 
-            self.ema_fid_scorer = FIDEvaluation(
-                batch_size=self.total_batch_size,
-                dl=self.dl,
-                sampler=self.ema.ema_model,
-                channels=self.channels,
-                accelerator=self.accelerator,
-                stats_dir=results_folder,
-                device=self.device,
-                num_fid_samples=num_fid_samples,
-                inception_block_idx=inception_block_idx
-            )
-
-            self.fid_scorer = FIDEvaluation(
-                batch_size=self.total_batch_size,
-                dl=self.dl,
-                sampler=self.model,
-                channels=self.channels,
-                accelerator=self.accelerator,
-                stats_dir=results_folder,
-                device=self.device,
-                num_fid_samples=num_fid_samples,
-                inception_block_idx=inception_block_idx
-            )
+            # if self.accelerator.is_last_process:
+            #     self.fid_scorer = FIDEvaluation(
+            #         batch_size=self.total_batch_size*4,
+            #         dl=self.dl,
+            #         sampler=diffusion_model,
+            #         channels=self.channels,
+            #         accelerator=self.accelerator,
+            #         stats_dir=results_folder,
+            #         device=self.device,
+            #         num_fid_samples=num_fid_samples,
+            #         inception_block_idx=inception_block_idx
+            #     )
 
 
         if save_best_and_latest_only:
@@ -1104,7 +1106,7 @@ class Trainer:
 
                 self.grad_norm = accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                if (self.step % self.tensorboard_log_steps == 0) and (self.tensor_writer is not None):
+                if (self.step % self.tensorboard_log_steps == 0) and (self.tensor_writer is not None) and (self.accelerator.is_main_process):
                     self.tensor_writer.add_scalar('Train/loss', total_loss/self.tensorboard_log_steps, self.step)
                     self.tensor_writer.add_scalar('Train/grad_norm', self.grad_norm, self.step)
                 total_loss = 0.
@@ -1135,15 +1137,16 @@ class Trainer:
                         # whether to calculate fid
 
                         if self.calculate_fid:
-                            ema_fid_score = self.ema_fid_scorer.fid_score()
-                            accelerator.print(f'ema fid_score: {ema_fid_score}')
+                            with torch.inference_mode():
+                                ema_fid_score = self.ema_fid_scorer.fid_score()
+                                accelerator.print(f'ema fid_score: {ema_fid_score}')
 
-                            fid_score = self.fid_scorer.fid_score()
-                            accelerator.print(f'fid_score: {fid_score}')
+                                # fid_score = self.fid_scorer.fid_score()
+                                # accelerator.print(f'fid_score: {fid_score}')
 
-                            if self.tensor_writer is not None:
-                                self.tensor_writer.add_scalar('Validation/ema_fid_score', ema_fid_score, self.step)
-                                self.tensor_writer.add_scalar('Validation/fid_score', fid_score, self.step)
+                                if self.tensor_writer is not None:
+                                    self.tensor_writer.add_scalar('Validation/ema_fid_score', ema_fid_score, self.step)
+                                    # self.tensor_writer.add_scalar('Validation/fid_score', fid_score, self.step)
 
                         if self.save_best_and_latest_only:
                             if self.best_fid > ema_fid_score:
@@ -1154,5 +1157,7 @@ class Trainer:
                             self.save(milestone)
 
                 pbar.update(1)
+                accelerator.wait_for_everyone()
 
+        accelerator.end_training()
         accelerator.print('training complete')
