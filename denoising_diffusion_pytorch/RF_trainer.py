@@ -91,6 +91,7 @@ class Trainer:
         validation_dataset = None,
         train_batch_size = 16,
         validation_batch_size = 16,
+        validation_active_ratio = None,
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
         train_lr_decay = 0.0,
@@ -184,8 +185,12 @@ class Trainer:
         # prepare validation dataset and dataloader
         self.val_ds = validation_dataset
         if self.val_ds is not None:
-            self.val_dl = DataLoader(self.val_ds, batch_size = self.validation_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count()//self.accelerator.num_processes)
-            self.val_dl_len = len(self.val_ds)
+            self.val_dl = DataLoader(self.val_ds, batch_size = self.validation_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count()//self.accelerator.num_processes)
+
+            if validation_active_ratio is not None:
+                self.active_val_len = int(len(self.val_dl) * validation_active_ratio)
+            else:
+                self.active_val_len = len(self.val_dl)
             self.val_dl = self.accelerator.prepare(self.val_dl)
 
             self.dummy_ema_model = copy.deepcopy(self.model)
@@ -315,6 +320,7 @@ class Trainer:
                         if self.val_dl is not None:
                             SNR_sum = torch.tensor(0.).to(device)
                             loss_sum = torch.tensor(0.).to(device)
+                            test_data_len = torch.tensor(0.)
 
                             # Broadcast ema model state dict
                             if self.accelerator.is_main_process:
@@ -326,7 +332,7 @@ class Trainer:
                             self.dummy_ema_model.load_state_dict(dummy_ema_state)
 
                             # Validation loop
-                            for data, cond in tqdm(self.val_dl, total= len(self.val_dl), desc = 'validation loop', disable = not accelerator.is_main_process):
+                            for v_idx, (data, cond) in enumerate(tqdm(self.val_dl, total= self.active_val_len, desc = 'validation loop', disable = not accelerator.is_main_process)):
                                 data = data.to(device, non_blocking = True)
                                 cond = cond.to(device, non_blocking = True)
 
@@ -340,12 +346,19 @@ class Trainer:
 
                                 SNR = cal_SNR(predict, data, complex_dim = self.complex_dim)
                                 SNR_sum += torch.sum(SNR)
+
+                                test_data_len += data.shape[0]
+
+                                if v_idx >= self.active_val_len:
+                                    break
                             
                             gathered_SNR = accelerator.gather_for_metrics(SNR_sum)
                             gathered_loss = accelerator.gather_for_metrics(loss_sum)
+                            gathered_len = accelerator.gather_for_metrics(test_data_len.to(device))
                             if accelerator.is_main_process:
-                                SNR = torch.sum(gathered_SNR).item() / self.val_dl_len
-                                loss = torch.sum(gathered_loss).item() / self.val_dl_len
+                                gathered_len = torch.sum(gathered_len).item()
+                                SNR = torch.sum(gathered_SNR).item() / gathered_len
+                                loss = torch.sum(gathered_loss).item() / gathered_len
                                 accelerator.print(f'SNR: {SNR:.2f}, Loss: {loss:.4f}')
                                 if self.tensor_writer is not None:
                                     self.tensor_writer.add_scalar('Validation/SNR', SNR, self.step)
