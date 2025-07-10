@@ -84,7 +84,10 @@ class Five_G_singlefile_dataset(Dataset):
         def single_file_handle(path):
             loaded_data = np.load(path).astype(np.complex64)
             loaded_data = np.transpose(loaded_data, (1, 0, 2, 3))
+            #  (N, T, Client, Splitted Time slot, Splited Node, Subcarrier)
             loaded_data = self.time_node_spliter(loaded_data, split_time_node=time_node_shape)
+
+            loaded_data = loaded_data[:, :, 1]  # TEMP : only use the second client
 
             return loaded_data.reshape(-1, *loaded_data.shape[-3:])
 
@@ -129,19 +132,19 @@ class Five_G_singlefile_dataset(Dataset):
             split_time_node (tuple): Tuple of two integers, the first one is the number of time slots for training,
                                     the second one is the number of nodes for training.
         Returns:
-            split_data (torch.tensor): Split data (N, Splitted Time slot, Splited Node, Subcarrier)
+            split_data (torch.tensor): Split data (N, T, Client, Splitted Time slot, Splited Node, Subcarrier)
         """
         # (Client, Time slot, Node, Subcarrier)
         time_split = np_split_in_size(data, split_time_node[0], axis=1)
         # if the last time slot is not fulled, remove it
 
         time_split = np.array(time_split)  
-
-        # time_split = (N, Client, Splitted Time slot, Node, Subcarrier)
+        # time_split = (T, Client, Splitted Time slot, Node, Subcarrier)
         time_node_split = np_split_in_size(time_split, split_time_node[1], axis=3)
         
-        # (N, Splitted Time slot, Splited Node, Subcarrier)
+        # (N, T, Client, Splitted Time slot, Splited Node, Subcarrier)
         time_node_split = np.stack(time_node_split, axis=0)
+
         return time_node_split
 
     def __len__(self):
