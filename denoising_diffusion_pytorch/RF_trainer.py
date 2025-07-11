@@ -187,11 +187,13 @@ class Trainer:
         if self.val_ds is not None:
             self.val_dl = DataLoader(self.val_ds, batch_size = self.validation_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count()//self.accelerator.num_processes)
 
+            self.val_dl = self.accelerator.prepare(self.val_dl)
+
             if validation_active_ratio is not None:
                 self.active_val_len = int(len(self.val_dl) * validation_active_ratio)
             else:
                 self.active_val_len = len(self.val_dl)
-            self.val_dl = self.accelerator.prepare(self.val_dl)
+
 
             self.dummy_ema_model = copy.deepcopy(self.model)
             self.dummy_ema_model.eval()

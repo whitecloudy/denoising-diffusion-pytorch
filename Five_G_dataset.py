@@ -87,7 +87,8 @@ class Five_G_singlefile_dataset(Dataset):
             #  (N, T, Client, Splitted Time slot, Splited Node, Subcarrier)
             loaded_data = self.time_node_spliter(loaded_data, split_time_node=time_node_shape)
 
-            loaded_data = loaded_data[:, :, 1]  # TEMP : only use the second client
+            # loaded_data = loaded_data[:, :, 1]  # TEMP : only use the second client
+            loaded_data = loaded_data[1]  # TEMP : only use the second node
 
             return loaded_data.reshape(-1, *loaded_data.shape[-3:])
 
