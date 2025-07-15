@@ -84,11 +84,10 @@ class Five_G_singlefile_dataset(Dataset):
         def single_file_handle(path):
             loaded_data = np.load(path).astype(np.complex64)
             loaded_data = np.transpose(loaded_data, (1, 0, 2, 3))
-            #  (N, T, Client, Splitted Time slot, Splited Node, Subcarrier)
+            print(f"Loaded data shape: {loaded_data.shape}")
+            # (Client, Time slot, Node, Subcarrier)
             loaded_data = self.time_node_spliter(loaded_data, split_time_node=time_node_shape)
-
-            # loaded_data = loaded_data[:, :, 1]  # TEMP : only use the second client
-            loaded_data = loaded_data[1]  # TEMP : only use the second node
+            #  (N, T, Client, Splitted Time slot, Splited Node, Subcarrier)
 
             return loaded_data.reshape(-1, *loaded_data.shape[-3:])
 
@@ -135,18 +134,25 @@ class Five_G_singlefile_dataset(Dataset):
         Returns:
             split_data (torch.tensor): Split data (N, T, Client, Splitted Time slot, Splited Node, Subcarrier)
         """
-        # (Client, Time slot, Node, Subcarrier)
-        time_split = np_split_in_size(data, split_time_node[0], axis=1)
-        # if the last time slot is not fulled, remove it
+        # # (Client, Time slot, Node, Subcarrier)
+        # # time_split = np_split_in_size(data, split_time_node[0], axis=1)
+        # time_split = np.array([data[:, i:i + split_time_node[0], :, :] for i in range(0, data.shape[1] - split_time_node[0])])
+        # # if the last time slot is not fulled, remove it
 
-        time_split = np.array(time_split)  
-        # time_split = (T, Client, Splitted Time slot, Node, Subcarrier)
-        time_node_split = np_split_in_size(time_split, split_time_node[1], axis=3)
+        # # time_split = np.array(time_split)  
+        # print("time split")
+        # # time_split = (T, Client, Splitted Time slot, Node, Subcarrier)
+        # time_node_split = np_split_in_size(time_split, split_time_node[1], axis=3)
         
-        # (N, T, Client, Splitted Time slot, Splited Node, Subcarrier)
-        time_node_split = np.stack(time_node_split, axis=0)
+        # # (N, T, Client, Splitted Time slot, Splited Node, Subcarrier)
+        # time_node_split = np.stack(time_node_split, axis=0)
+        # print("node split")
+        # return time_node_split
 
-        return time_node_split
+        # Choose only first client and first node set
+        data = data[1,:,:split_time_node[1],:]
+        data = np.array([data[i:i + split_time_node[0]] for i in range(0, data.shape[0] - split_time_node[0])])
+        return data
 
     def __len__(self):
         return self.data.shape[0]
@@ -249,20 +255,20 @@ if __name__ == "__main__":
     from accelerate import Accelerator
     import tqdm
     
-    training_datafiles = ['../data/RENEW_processed/ArgosCSI-96x8-2016-11-04-05-37-37_2.4GHz_track_left_to_right_NLOS.npy',
-                            '../data/RENEW_processed/ArgosCSI-96x8-2016-05-01-06-57-58-2.4GHz-continuousmobile.npy',
-                            '../data/RENEW_processed/ArgosCSI-96x2-2016-12-07-03-00-36_rotation_mob_horizontal_omni.npy']
+    training_datafiles = ['../data/RENEW_processed/ArgosCSI-96x8-2016-11-04-05-37-37_2.4GHz_track_left_to_right_NLOS.npy',]
+                            # '../data/RENEW_processed/ArgosCSI-96x8-2016-05-01-06-57-58-2.4GHz-continuousmobile.npy',
+                            # '../data/RENEW_processed/ArgosCSI-96x2-2016-12-07-03-00-36_rotation_mob_horizontal_omni.npy']
 
-    dataset = Five_G_singlefile_dataset(data_path=training_datafiles, transpose=(0, 2, 1))
+    dataset = Five_G_singlefile_dataset(data_path=training_datafiles, time_node_shape=(14, 8), transpose=(0, 2, 1))
 
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=cpu_count(), pin_memory=True)
+    # dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=cpu_count(), pin_memory=True)
 
-    input("Press Enter to continue...")
+    # input("Press Enter to continue...")
 
-    for data, cond in dataloader:
-        print(data.shape, cond.shape)
-        print(data.dtype, cond.dtype)
-        print(data[0, 0, 0], cond[0, 0, 0])
-        print(data[0, 1, 0], cond[0, 1, 0])
-        print(data[0, 2, 0], cond[0, 2, 0])
-        break
+    # for data, cond in dataloader:
+    #     print(data.shape, cond.shape)
+    #     print(data.dtype, cond.dtype)
+    #     print(data[0, 0, 0], cond[0, 0, 0])
+    #     print(data[0, 1, 0], cond[0, 1, 0])
+    #     print(data[0, 2, 0], cond[0, 2, 0])
+    #     break
