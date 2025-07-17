@@ -190,7 +190,7 @@ class Trainer:
             self.val_dl = self.accelerator.prepare(self.val_dl)
 
             if validation_active_ratio is not None:
-                self.active_val_len = int(len(self.val_dl) * validation_active_ratio)
+                self.active_val_len = max(int(len(self.val_dl) * validation_active_ratio), 1)
             else:
                 self.active_val_len = len(self.val_dl)
 
@@ -272,6 +272,62 @@ class Trainer:
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
+    @torch.inference_mode()
+    def evaluate(self, 
+                 dataloader : torch.utils.data.DataLoader, 
+                 active_data_len=-1):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        SNR_sum = torch.tensor(0.).to(device)
+        loss_sum = torch.tensor(0.).to(device)
+        test_data_len = torch.tensor(0.)
+
+        # Broadcast ema model state dict
+        if self.accelerator.is_main_process:
+            dummy_ema_state = self.ema.ema_model.state_dict()
+        else:
+            dummy_ema_state = self.dummy_ema_model.state_dict()
+
+        accelerate.utils.broadcast(dummy_ema_state)
+        self.dummy_ema_model.load_state_dict(dummy_ema_state)
+        if active_data_len < 0:
+            active_data_len = len(dataloader)
+        # Validation loop
+        for v_idx, (data, cond) in enumerate(tqdm(dataloader, total=active_data_len, desc = 'validation loop', disable = not accelerator.is_main_process)):
+            data = data.to(device, non_blocking = True)
+            cond = cond.to(device, non_blocking = True)
+
+            predict = self.dummy_ema_model.sample_with_class(
+                classes = cond,
+            )
+
+            loss = F.mse_loss(predict, data, reduction = 'none')
+            loss = reduce(loss, 'b ... -> b', 'mean')
+            loss_sum += torch.sum(loss)
+
+            SNR = cal_SNR(predict, data, complex_dim = self.complex_dim)
+            SNR_sum += torch.sum(SNR)
+
+            test_data_len += data.shape[0]
+
+            if v_idx >= active_data_len:
+                break
+        
+        gathered_SNR = accelerator.gather_for_metrics(SNR_sum)
+        gathered_loss = accelerator.gather_for_metrics(loss_sum)
+        gathered_len = accelerator.gather_for_metrics(test_data_len.to(device))
+        if accelerator.is_main_process:
+            gathered_len = torch.sum(gathered_len).item()
+            SNR = torch.sum(gathered_SNR).item() / gathered_len
+            loss = torch.sum(gathered_loss).item() / gathered_len
+        else:
+            SNR = None
+            loss = None
+
+        return SNR, loss
+
+
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
@@ -320,55 +376,16 @@ class Trainer:
                     with torch.inference_mode():
                         # Validation
                         if self.val_dl is not None:
-                            SNR_sum = torch.tensor(0.).to(device)
-                            loss_sum = torch.tensor(0.).to(device)
-                            test_data_len = torch.tensor(0.)
+                            SNR, loss = self.evaluate(self.val_dl, self.active_val_len)
 
-                            # Broadcast ema model state dict
-                            if self.accelerator.is_main_process:
-                                dummy_ema_state = self.ema.ema_model.state_dict()
-                            else:
-                                dummy_ema_state = self.dummy_ema_model.state_dict()
-
-                            accelerate.utils.broadcast(dummy_ema_state)
-                            self.dummy_ema_model.load_state_dict(dummy_ema_state)
-
-                            # Validation loop
-                            for v_idx, (data, cond) in enumerate(tqdm(self.val_dl, total= self.active_val_len, desc = 'validation loop', disable = not accelerator.is_main_process)):
-                                data = data.to(device, non_blocking = True)
-                                cond = cond.to(device, non_blocking = True)
-
-                                predict = self.dummy_ema_model.sample_with_class(
-                                    classes = cond,
-                                )
-
-                                loss = F.mse_loss(predict, data, reduction = 'none')
-                                loss = reduce(loss, 'b ... -> b', 'mean')
-                                loss_sum += torch.sum(loss)
-
-                                SNR = cal_SNR(predict, data, complex_dim = self.complex_dim)
-                                SNR_sum += torch.sum(SNR)
-
-                                test_data_len += data.shape[0]
-
-                                if v_idx >= self.active_val_len:
-                                    break
-                            
-                            gathered_SNR = accelerator.gather_for_metrics(SNR_sum)
-                            gathered_loss = accelerator.gather_for_metrics(loss_sum)
-                            gathered_len = accelerator.gather_for_metrics(test_data_len.to(device))
-                            if accelerator.is_main_process:
-                                gathered_len = torch.sum(gathered_len).item()
-                                SNR = torch.sum(gathered_SNR).item() / gathered_len
-                                loss = torch.sum(gathered_loss).item() / gathered_len
-                                accelerator.print(f'SNR: {SNR:.2f}, Loss: {loss:.4f}')
-                                if self.tensor_writer is not None:
-                                    self.tensor_writer.add_scalar('Validation/SNR', SNR, self.step)
-                                    self.tensor_writer.add_scalar('Validation/Loss', loss, self.step)
-                        
-                        # save model
-                        milestone = self.step // self.save_and_sample_every
                         if self.accelerator.is_main_process:
+                            accelerator.print(f'SNR: {SNR:.2f}, Loss: {loss:.4f}')
+                            if self.tensor_writer is not None:
+                                self.tensor_writer.add_scalar('Validation/SNR', SNR, self.step)
+                                self.tensor_writer.add_scalar('Validation/Loss', loss, self.step)
+
+                            # save model
+                            milestone = self.step // self.save_and_sample_every
                             if self.save_best_and_latest_only:
                                 if self.best_SNR < SNR:
                                     self.best_SNR = SNR
@@ -377,8 +394,8 @@ class Trainer:
                             else:
                                 self.save(milestone)
 
-                        if self.tensor_writer is not None:
-                            self.tensor_writer.flush()
+                            if self.tensor_writer is not None:
+                                self.tensor_writer.flush()
 
                         accelerator.wait_for_everyone()
 
