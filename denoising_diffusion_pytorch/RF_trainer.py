@@ -194,12 +194,6 @@ class Trainer:
             else:
                 self.active_val_len = len(self.val_dl)
 
-
-            self.dummy_ema_model = copy.deepcopy(self.model)
-            self.dummy_ema_model.eval()
-            self.dummy_ema_model.requires_grad_(False)
-            self.dummy_ema_model.to(self.device)
-            self.dummy_ema_model.tqdm_disable = not self.accelerator.is_main_process
         else:
             self.val_dl = None
 
@@ -211,7 +205,10 @@ class Trainer:
 
         if self.accelerator.is_main_process:
             self.ema = EMA(self.model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
+        else:
+            dummy_model = copy.deepcopy(self.model)
+            self.ema = EMA(dummy_model, beta = ema_decay, update_every = ema_update_every)
+        self.ema.to(self.device)
 
         if results_folder is None:
             self.result_temp_folder = tempfile.TemporaryDirectory()
@@ -284,13 +281,13 @@ class Trainer:
         test_data_len = torch.tensor(0.)
 
         # Broadcast ema model state dict
-        if self.accelerator.is_main_process:
-            dummy_ema_state = self.ema.ema_model.state_dict()
-        else:
-            dummy_ema_state = self.dummy_ema_model.state_dict()
+        ema_state = self.ema.state_dict()
 
-        accelerate.utils.broadcast(dummy_ema_state)
-        self.dummy_ema_model.load_state_dict(dummy_ema_state)
+        accelerate.utils.broadcast(ema_state)
+        self.ema.load_state_dict(ema_state)
+        if not self.accelerator.is_main_process:
+            self.ema.ema_model.tqdm_disable = True
+
         if active_data_len < 0:
             active_data_len = len(dataloader)
         # Validation loop
@@ -298,7 +295,7 @@ class Trainer:
             data = data.to(device, non_blocking = True)
             cond = cond.to(device, non_blocking = True)
 
-            predict = self.dummy_ema_model.sample_with_class(
+            predict = self.ema.ema_model.sample_with_class(
                 classes = cond,
             )
 
@@ -311,7 +308,7 @@ class Trainer:
 
             test_data_len += data.shape[0]
 
-            if v_idx >= active_data_len:
+            if v_idx >= (active_data_len-1):
                 break
         
         gathered_SNR = accelerator.gather_for_metrics(SNR_sum)
