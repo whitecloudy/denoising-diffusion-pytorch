@@ -402,6 +402,8 @@ class GaussianDiffusion(nn.Module):
         min_snr_loss_weight = False,
         min_snr_gamma = 5,
         tqdm_disable = False,
+        use_loss_weights = True,
+        
     ):
         super().__init__()
 
@@ -470,21 +472,23 @@ class GaussianDiffusion(nn.Module):
         self.offset_noise_strength = offset_noise_strength
 
         # loss weight
+        self.use_loss_weights = use_loss_weights
 
-        snr = alphas_cumprod / (1 - alphas_cumprod)
+        if self.use_loss_weights:
+            snr = alphas_cumprod / (1 - alphas_cumprod)
 
-        maybe_clipped_snr = snr.clone()
-        if min_snr_loss_weight:
-            maybe_clipped_snr.clamp_(max = min_snr_gamma)
+            maybe_clipped_snr = snr.clone()
+            if min_snr_loss_weight:
+                maybe_clipped_snr.clamp_(max = min_snr_gamma)
 
-        if objective == 'pred_noise':
-            loss_weight = maybe_clipped_snr / snr
-        elif objective == 'pred_x0':
-            loss_weight = maybe_clipped_snr
-        elif objective == 'pred_v':
-            loss_weight = maybe_clipped_snr / (snr + 1)
+            if objective == 'pred_noise':
+                loss_weight = maybe_clipped_snr / snr
+            elif objective == 'pred_x0':
+                loss_weight = maybe_clipped_snr
+            elif objective == 'pred_v':
+                loss_weight = maybe_clipped_snr / (snr + 1)
 
-        register_buffer('loss_weight', loss_weight)
+            register_buffer('loss_weight', loss_weight)
 
     @property
     def device(self):
@@ -583,9 +587,16 @@ class GaussianDiffusion(nn.Module):
 
         x_start = None
 
+        from denoising_diffusion_pytorch.RF_trainer import cal_SNR
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps, disable=self.tqdm_disable):
             img, x_start = self.p_sample(img, t, classes)
 
+            # SNR = cal_SNR(data, x_start, -1)
+            # x_start_SNR = torch.mean(SNR).item()
+
+            # SNR = cal_SNR(data, img, -1)
+            # img_SNR = torch.mean(SNR).item()
+        
         return img
 
     @torch.inference_mode()
@@ -684,8 +695,8 @@ class GaussianDiffusion(nn.Module):
             raise ValueError(f'unknown objective {self.objective}')
         loss = F.mse_loss(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b', 'mean')
-
-        loss = loss * extract(self.loss_weight, t, loss.shape)
+        if self.use_loss_weights:
+            loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
     def forward(self, img, *args, **kwargs):
